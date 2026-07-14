@@ -35,68 +35,105 @@ class MicropriceSkew(QuoteAdjuster):
         return ctx.fair_yes + self.weight * (microprice - mid), 0.0, 0.0
 
 
-class ToxicityGate(QuoteAdjuster):
-    """Model T consumer: per-side P(toxic) from side-mirrored features."""
+def _bucket_model(models: list[LinearModel], seconds_to_close: float) -> Optional[LinearModel]:
+    for model in models:
+        if model.bucket[0] <= seconds_to_close < model.bucket[1]:
+            return model
+    return None
 
-    def __init__(self, models: list[LinearModel], *, scale_dollars: float = 0.02, base: float = 0.5):
+
+def context_raw_features(ctx: QuoteContext) -> dict[str, Optional[float]]:
+    """The training feature vocabulary, computed live from the replay context.
+
+    jump_ratio is not tracked in replay and enters as neutral 0 (it is a
+    known-dead feature; STRATEGY.md decision log 2026-07-14).
+    """
+    bbo = ctx.bbo
+    total = bbo.bid_size + bbo.ask_size
+    mid = (bbo.bid + bbo.ask) / 2.0 if bbo.bid is not None and bbo.ask is not None else None
+    microprice = (
+        (bbo.ask * bbo.bid_size + bbo.bid * bbo.ask_size) / total if total > 0 and mid is not None else mid
+    )
+    bids3 = ctx.book.top_levels("bid", 3)
+    asks3 = ctx.book.top_levels("ask", 3)
+    depth_bid3 = sum(size for _, size in bids3)
+    depth_ask3 = sum(size for _, size in asks3)
+    depth3 = depth_bid3 + depth_ask3
+    return {
+        "imb_top1": (bbo.bid_size - bbo.ask_size) / total if total > 0 else 0.0,
+        "imb_top3": (depth_bid3 - depth_ask3) / depth3 if depth3 > 0 else 0.0,
+        "microprice_minus_mid": (microprice - mid) if microprice is not None and mid is not None else 0.0,
+        "flow_1s": ctx.flow_1s,
+        "flow_5s": ctx.flow_5s,
+        "bid_size_delta": ctx.bid_size_delta,
+        "ask_size_delta": ctx.ask_size_delta,
+        "ext_micro_lead_bps": ctx.ext_micro_lead_bps,
+        "ext_imbalance": ctx.ext_imbalance,
+        "spread": (bbo.ask - bbo.bid) if bbo.bid is not None and bbo.ask is not None else None,
+        "gbm_fair_minus_mid": (ctx.fair_yes - mid) if mid is not None else 0.0,
+        "trades_5s": float(ctx.trades_5s),
+        "jump_ratio": 0.0,
+    }
+
+
+class ModelVSkew(QuoteAdjuster):
+    """Fitted Model V consumer: center quotes on mid + predicted 5s move."""
+
+    def __init__(self, models: list[LinearModel], *, weight: float = 1.0):
+        self.models = models
+        self.weight = weight
+        self.name = "modelv"
+
+    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+        model = _bucket_model(self.models, ctx.seconds_to_close)
+        bbo = ctx.bbo
+        if model is None or bbo.bid is None or bbo.ask is None:
+            return ctx.fair_yes, 0.0, 0.0
+        raw = context_raw_features(ctx)
+        prediction = model.predict([raw.get(name) for name in model.features], impute_missing=True)
+        if prediction is None:
+            return ctx.fair_yes, 0.0, 0.0
+        mid = (bbo.bid + bbo.ask) / 2.0
+        return mid + self.weight * prediction, 0.0, 0.0
+
+
+class ToxicityGate(QuoteAdjuster):
+    """Model T consumer: per-side P(toxic) from side-mirrored features.
+
+    The tax activates when predicted probability exceeds the model's own
+    training base rate (stored in meta), not a fixed 0.5 — state-model base
+    rates run 0.15-0.35 and a fixed threshold would rarely fire.
+    """
+
+    def __init__(self, models: list[LinearModel], *, scale_dollars: float = 0.02, base: Optional[float] = None):
         self.models = models
         self.scale_dollars = scale_dollars
         self.base = base
         self.name = "toxgate"
 
-    def _model_for(self, seconds_to_close: float) -> Optional[LinearModel]:
-        for model in self.models:
-            if model.bucket[0] <= seconds_to_close < model.bucket[1]:
-                return model
-        return None
-
-    def _raw_features(self, ctx: QuoteContext) -> dict[str, Optional[float]]:
-        bbo = ctx.bbo
-        total = bbo.bid_size + bbo.ask_size
-        mid = (bbo.bid + bbo.ask) / 2.0 if bbo.bid is not None and bbo.ask is not None else None
-        microprice = (
-            (bbo.ask * bbo.bid_size + bbo.bid * bbo.ask_size) / total if total > 0 and mid is not None else mid
-        )
-        bids3 = ctx.book.top_levels("bid", 3)
-        asks3 = ctx.book.top_levels("ask", 3)
-        depth_bid3 = sum(size for _, size in bids3)
-        depth_ask3 = sum(size for _, size in asks3)
-        depth3 = depth_bid3 + depth_ask3
-        return {
-            "imb_top1": (bbo.bid_size - bbo.ask_size) / total if total > 0 else 0.0,
-            "imb_top3": (depth_bid3 - depth_ask3) / depth3 if depth3 > 0 else 0.0,
-            "microprice_minus_mid": (microprice - mid) if microprice is not None and mid is not None else 0.0,
-            "flow_1s": ctx.flow_1s,
-            "flow_5s": ctx.flow_5s,
-            # Depth deltas and external features are not tracked in replay context
-            # yet; mirrored values fall back to 0 (neutral) via `or 0.0` below.
-            "bid_size_delta": 0.0,
-            "ask_size_delta": 0.0,
-            "ext_micro_lead_bps": 0.0,
-            "ext_imbalance": 0.0,
-            "spread": (bbo.ask - bbo.bid) if bbo.bid is not None and bbo.ask is not None else None,
-            "gbm_fair_minus_mid": (ctx.fair_yes - mid) if mid is not None else 0.0,
-            "trades_5s": 0.0,
-        }
-
     def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
-        model = self._model_for(ctx.seconds_to_close)
+        model = _bucket_model(self.models, ctx.seconds_to_close)
         if model is None:
             return ctx.fair_yes, 0.0, 0.0
-        raw = self._raw_features(ctx)
+        base = self.base if self.base is not None else float(model.meta.get("base_rate", 0.5))
+        raw = context_raw_features(ctx)
         taxes = {}
         for side in ("bid", "ask"):
             mirrored = mirror_features(raw, side)
-            probability = model.predict([mirrored.get(name) for name in model.features])
+            probability = model.predict(
+                [mirrored.get(name) for name in model.features], impute_missing=True
+            )
             if probability is None:
                 taxes[side] = 0.0
                 continue
-            excess = max(0.0, probability - self.base) / max(1e-9, 1.0 - self.base)
+            excess = max(0.0, probability - base) / max(1e-9, 1.0 - base)
             taxes[side] = excess * self.scale_dollars
         return ctx.fair_yes, taxes["bid"], taxes["ask"]
 
 
-def build_variants(spec: str, model_t_path: Optional[str]) -> list[QuoteAdjuster]:
+def build_variants(
+    spec: str, model_t_path: Optional[str], model_v_path: Optional[str] = None
+) -> list[QuoteAdjuster]:
     variants: list[QuoteAdjuster] = []
     for name in spec.split(","):
         name = name.strip()
@@ -106,8 +143,15 @@ def build_variants(spec: str, model_t_path: Optional[str]) -> list[QuoteAdjuster
             variants.append(MicropriceSkew(int(name[5:]) / 100.0))
         elif name == "toxgate":
             if not model_t_path or not Path(model_t_path).exists():
-                raise SystemExit("toxgate variant requires --model-t pointing at model_t.json")
+                raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
             variants.append(ToxicityGate(load_models(model_t_path)))
+        elif name == "modelv":
+            if not model_v_path or not Path(model_v_path).exists():
+                raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
+            # Use the book-feature-set bucket models (ext-set models require
+            # externals to be fresh; book models degrade more gracefully).
+            models = [m for m in load_models(model_v_path) if m.meta.get("feature_set") == "book"]
+            variants.append(ModelVSkew(models))
         else:
             raise SystemExit(f"unknown variant: {name}")
     return variants
@@ -209,10 +253,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("recordings", nargs="+")
     parser.add_argument("--variants", default="baseline,micro25,micro50")
     parser.add_argument("--model-t", default="data/models/model_t_state.json")
+    parser.add_argument("--model-v", default="data/models/model_v.json")
     parser.add_argument("--latency-ms", type=int, default=150)
     parser.add_argument("--maker-fee-multiplier", type=float, default=0.0)
     args = parser.parse_args(argv)
-    variants = build_variants(args.variants, args.model_t)
+    variants = build_variants(args.variants, args.model_t, args.model_v)
     outcomes = run_ab(
         args.recordings,
         variants,

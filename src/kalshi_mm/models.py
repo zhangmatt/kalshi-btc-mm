@@ -118,16 +118,22 @@ class LinearModel:
     n_train: int
     meta: dict = field(default_factory=dict)
 
-    def raw_score(self, values: Sequence[Optional[float]]) -> Optional[float]:
+    def raw_score(
+        self, values: Sequence[Optional[float]], *, impute_missing: bool = False
+    ) -> Optional[float]:
         total = self.intercept
         for value, mean, std, coef in zip(values, self.means, self.stds, self.coefs):
             if value is None:
-                return None
+                if not impute_missing:
+                    return None
+                continue  # missing -> training mean -> standardized 0 contribution
             total += coef * (value - mean) / (std if std > 0 else 1.0)
         return total
 
-    def predict(self, values: Sequence[Optional[float]]) -> Optional[float]:
-        score = self.raw_score(values)
+    def predict(
+        self, values: Sequence[Optional[float]], *, impute_missing: bool = False
+    ) -> Optional[float]:
+        score = self.raw_score(values, impute_missing=impute_missing)
         if score is None:
             return None
         if self.kind == "logistic":
@@ -246,8 +252,13 @@ def fit_logistic(
 def chronological_split(
     window_ids: list[str], *, train_frac: float = 0.6, val_frac: float = 0.2
 ) -> tuple[list[str], list[str], list[str]]:
-    """Train/validation/holdout by chronological window order (STRATEGY.md §6)."""
-    ordered = sorted(set(window_ids))
+    """Train/validation/holdout by window order (STRATEGY.md §6).
+
+    Input MUST already be in chronological order (by data timestamp). Ticker
+    strings must never be sorted for this: their embedded month names do not
+    sort chronologically (AUG < JUL alphabetically).
+    """
+    ordered = list(dict.fromkeys(window_ids))
     n = len(ordered)
     train_end = max(1, int(n * train_frac))
     val_end = max(train_end + 1, int(n * (train_frac + val_frac)))

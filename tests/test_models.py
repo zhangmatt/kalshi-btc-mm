@@ -67,13 +67,17 @@ def test_model_json_round_trip(tmp_path):
     assert loaded.predict([0.5, 0.5]) == pytest.approx(model.predict([0.5, 0.5]))
 
 
-def test_chronological_split_orders_and_partitions():
-    ids = [f"W{i:03d}" for i in range(10)]
-    random.Random(0).shuffle(ids)
+def test_chronological_split_preserves_given_order():
+    # Input order is authoritative (callers order by data timestamp). Ticker
+    # strings like 26AUG.../26JUL... do NOT sort chronologically, so the split
+    # must never re-sort.
+    ids = ["26JUL14-A", "26JUL14-B", "26JUL31-C", "26AUG01-D", "26AUG02-E"]
     train, val, holdout = chronological_split(ids)
-    assert train == [f"W{i:03d}" for i in range(6)]
-    assert val == ["W006", "W007"]
-    assert holdout == ["W008", "W009"]
+    assert train == ["26JUL14-A", "26JUL14-B", "26JUL31-C"]
+    assert val == ["26AUG01-D"]
+    assert holdout == ["26AUG02-E"]
+    # Duplicates collapse without reordering.
+    assert chronological_split(["b", "a", "b", "c", "d", "e"])[0] == ["b", "a", "c"]
 
 
 def test_block_bootstrap_ci_covers_mean():

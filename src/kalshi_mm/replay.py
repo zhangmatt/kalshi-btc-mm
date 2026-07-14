@@ -136,6 +136,11 @@ class QuoteContext:
     book: KalshiOrderBook
     flow_5s: float
     flow_1s: float
+    trades_5s: int = 0
+    bid_size_delta: float = 0.0
+    ask_size_delta: float = 0.0
+    ext_micro_lead_bps: Optional[float] = None
+    ext_imbalance: Optional[float] = None
 
 
 class QuoteAdjuster:
@@ -224,6 +229,9 @@ def replay_rows(
         ),
     )
     trade_flow: deque[tuple[int, float]] = deque()
+    external_books: dict[str, tuple[int, Optional[float], Optional[float]]] = {}
+    prev_bid_size: Optional[float] = None
+    prev_ask_size: Optional[float] = None
     simulator = ConservativeQueueSimulator()
     inventory = KalshiInventory()
     fills: list[ReplayFill] = []
@@ -241,7 +249,19 @@ def replay_rows(
     for row in rows:
         ts_ms = int(row["receive_ts_ms"])
         payload = row["payload"]
-        if row["source"] != "kalshi":
+        source = row.get("source")
+        if source in {"binance", "coinbase", "kraken"}:
+            if adjuster is not None and row.get("event_type") == "external_orderbook":
+                try:
+                    external_books[source] = (
+                        ts_ms,
+                        float(payload["microprice"]) if payload.get("microprice") is not None else None,
+                        float(payload["depth_imbalance"]) if payload.get("depth_imbalance") is not None else None,
+                    )
+                except (TypeError, ValueError, KeyError):
+                    pass
+            continue
+        if source != "kalshi":
             continue
         book.apply(payload, use_yes_price=True)
         if brti.apply(payload) and brti.value is not None:
@@ -281,6 +301,16 @@ def replay_rows(
                 if adjuster is not None:
                     while trade_flow and trade_flow[0][0] < ts_ms - 5_000:
                         trade_flow.popleft()
+                    micro_leads = [
+                        (micro - brti.value) / brti.value * 10_000
+                        for venue_ts, micro, _ in external_books.values()
+                        if micro is not None and ts_ms - venue_ts <= 2_000
+                    ]
+                    ext_imbs = [
+                        imb
+                        for venue_ts, _, imb in external_books.values()
+                        if imb is not None and ts_ms - venue_ts <= 2_000
+                    ]
                     context = QuoteContext(
                         ts_ms=ts_ms,
                         seconds_to_close=seconds_to_close,
@@ -289,7 +319,13 @@ def replay_rows(
                         book=book,
                         flow_5s=sum(count for _, count in trade_flow),
                         flow_1s=sum(count for flow_ts, count in trade_flow if flow_ts >= ts_ms - 1_000),
+                        trades_5s=len(trade_flow),
+                        bid_size_delta=bbo.bid_size - prev_bid_size if prev_bid_size is not None else 0.0,
+                        ask_size_delta=bbo.ask_size - prev_ask_size if prev_ask_size is not None else 0.0,
+                        ext_micro_lead_bps=sorted(micro_leads)[len(micro_leads) // 2] if micro_leads else None,
+                        ext_imbalance=sorted(ext_imbs)[len(ext_imbs) // 2] if ext_imbs else None,
                     )
+                    prev_bid_size, prev_ask_size = bbo.bid_size, bbo.ask_size
                     fair_yes, bid_tox, ask_tox = adjuster.adjust(context)
                     fair_yes = min(0.999, max(0.001, fair_yes))
                     last_fair = fair_yes

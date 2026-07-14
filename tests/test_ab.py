@@ -72,7 +72,30 @@ def test_build_variants_parses_spec(tmp_path):
     with pytest.raises(SystemExit):
         build_variants("toxgate", str(tmp_path / "missing.json"))
     with pytest.raises(SystemExit):
+        build_variants("modelv", None, str(tmp_path / "missing.json"))
+    with pytest.raises(SystemExit):
         build_variants("nonsense", None)
+
+
+def test_model_v_variant_centers_on_mid_plus_prediction(tmp_path):
+    from kalshi_mm.ab import ModelVSkew
+    from kalshi_mm.models import FEATURE_SETS, fit_ridge
+
+    features = FEATURE_SETS["book"]
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=(500, len(features)))
+    y = 0.02 * x[:, list(features).index("imb_top1")]  # move follows imbalance
+    model = fit_ridge(x, y, features=features, bucket=(300.0, 600.0), l2=1e-6)
+    model.meta["feature_set"] = "book"
+    variant = ModelVSkew([model])
+    ctx = _context(bid_size=30.0, ask_size=10.0)  # bid-heavy: positive imbalance
+    fair, bid_tox, ask_tox = variant.adjust(ctx)
+    assert bid_tox == ask_tox == 0.0
+    assert fair > 0.50  # centered above mid when the book leans up
+    # No bucket match -> passthrough.
+    from dataclasses import replace
+
+    assert variant.adjust(replace(ctx, seconds_to_close=800.0))[0] == ctx.fair_yes
 
 
 def test_run_ab_end_to_end(tmp_path, active_recording, capsys):

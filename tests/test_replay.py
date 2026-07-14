@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from kalshi_mm.recorder import EventRecorder
 from kalshi_mm.replay import ConservativeQueueSimulator, replay
 from kalshi_mm.strategy import KalshiQuote
@@ -87,6 +89,43 @@ def _write_latency_fixture(path) -> None:
         # This tick is past the activation time, so pending orders join the book.
         brti(start_s * 1000 + 4_000)
         trade(start_s * 1000 + 4_100)
+
+
+def test_adjuster_context_carries_external_and_depth_state(tmp_path):
+    from kalshi_mm.replay import QuoteAdjuster, replay_rows
+    from kalshi_mm.exchange import KalshiMarket
+    from kalshi_mm.recorder import iter_events
+
+    path = tmp_path / "events.jsonl"
+    _write_latency_fixture(path)
+    rows = list(iter_events(path))
+    # Splice an external book observation fresh (<2s) at the first decision,
+    # which fires at the +3000ms BRTI tick once the volatility forecast resolves.
+    external = {
+        "receive_ts_ms": 1_800_000_000 * 1000 + 2_500,
+        "source": "coinbase",
+        "event_type": "external_orderbook",
+        "payload": {"microprice": 100.05, "depth_imbalance": 0.4, "mid": 100.04},
+    }
+    index = next(i for i, row in enumerate(rows) if int(row["receive_ts_ms"]) > external["receive_ts_ms"])
+    rows.insert(index, external)
+    metadata = next(row["payload"] for row in rows if row["event_type"] == "market_metadata")
+    market = KalshiMarket.from_api(metadata)
+    captured = []
+
+    class Capture(QuoteAdjuster):
+        def adjust(self, ctx):
+            captured.append(ctx)
+            return ctx.fair_yes, 0.0, 0.0
+
+    replay_rows(market, rows, latency_ms=0, maker_fee_multiplier=0.0, adjuster=Capture())
+    assert captured
+    first = captured[0]
+    # BRTI is 100.0 and coinbase microprice 100.05 -> lead of ~+5bp.
+    assert first.ext_micro_lead_bps == pytest.approx(5.0, abs=0.5)
+    assert first.ext_imbalance == pytest.approx(0.4)
+    # The first trade prints after the first decision; later contexts see it.
+    assert any(ctx.trades_5s >= 1 for ctx in captured)
 
 
 def test_replay_latency_delays_order_activation(tmp_path):

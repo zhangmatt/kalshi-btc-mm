@@ -37,15 +37,20 @@ STATE_TAIL_DOLLARS = 0.01
 
 
 def load_store(pattern: str) -> dict[str, list[dict[str, Any]]]:
-    """window ticker -> rows, chronologically keyed by ticker sort order."""
+    """window ticker -> rows, ordered chronologically by first data timestamp.
+
+    Ticker strings must not be used for ordering: embedded month names do not
+    sort chronologically.
+    """
     from .features import read_parquet_rows
 
-    store: dict[str, list[dict[str, Any]]] = {}
-    for path in sorted(glob.glob(pattern)):
+    loaded: list[tuple[int, str, list[dict[str, Any]]]] = []
+    for path in glob.glob(pattern):
         rows = read_parquet_rows(path)
         if rows:
-            store[str(rows[0]["ticker"])] = rows
-    return store
+            first_ts = min(int(row["ts_ms"]) for row in rows)
+            loaded.append((first_ts, str(rows[0]["ticker"]), rows))
+    return {ticker: rows for _, ticker, rows in sorted(loaded, key=lambda item: item[0])}
 
 
 def _matrix(
