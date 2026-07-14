@@ -62,6 +62,15 @@ class KalshiWebSocket:
         if self._thread:
             self._thread.join(timeout=5.0)
 
+    def reconnect(self) -> None:
+        """Force a fresh connection (and therefore a fresh book snapshot)."""
+        self.order_book.invalidate()
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
     def _subscriptions(self) -> list[dict[str, Any]]:
         commands = [
             {

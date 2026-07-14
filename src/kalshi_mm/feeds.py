@@ -255,6 +255,7 @@ class ExternalBookStream:
         truncate_to_depth: bool = False,
         validate_kraken_checksum: bool = False,
         enforce_sequence: bool = False,
+        sequence_extractor: Optional[Callable[[dict[str, Any]], Optional[int]]] = None,
         insecure_ssl: bool = False,
         verbose: bool = False,
     ):
@@ -270,6 +271,7 @@ class ExternalBookStream:
         self.sample_interval_ms = max(1, round(1_000 / sample_hz))
         self.validate_kraken_checksum = validate_kraken_checksum
         self.enforce_sequence = enforce_sequence
+        self.sequence_extractor = sequence_extractor
         self.insecure_ssl = insecure_ssl
         self.verbose = verbose
         self.last_event_ms = 0
@@ -322,27 +324,40 @@ class ExternalBookStream:
         receive_ts_ms = time.time_ns() // 1_000_000
         try:
             payload = json.loads(message, parse_float=Decimal)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._record_status("parse_error", error=str(exc))
+            return
+
+        # Sequence numbers cover the whole connection (Coinbase includes
+        # heartbeats and subscription acks), so check them before the parser
+        # filters non-book messages; any skipped number means lost data.
+        if self.enforce_sequence:
+            try:
+                sequence = self.sequence_extractor(payload) if self.sequence_extractor else None
+            except (TypeError, ValueError):
+                sequence = None
+            if sequence is not None:
+                if self._last_sequence is not None and sequence > self._last_sequence + 1:
+                    self._record_status(
+                        "sequence_gap",
+                        expected=self._last_sequence + 1,
+                        received=sequence,
+                    )
+                    self.state.reset()
+                    self._last_sequence = None
+                    self._ws.close()
+                    return
+                if self._last_sequence is not None and sequence <= self._last_sequence:
+                    return
+                self._last_sequence = sequence
+
+        try:
             updates = self.parser(payload)
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             self._record_status("parse_error", error=str(exc))
             return
         if not updates:
             return
-
-        sequence = updates[0].sequence
-        if sequence is not None and self.enforce_sequence:
-            if self._last_sequence is not None and sequence > self._last_sequence + 1:
-                self._record_status(
-                    "sequence_gap",
-                    expected=self._last_sequence + 1,
-                    received=sequence,
-                )
-                self.state.reset()
-                self._ws.close()
-                return
-            if self._last_sequence is not None and sequence <= self._last_sequence:
-                return
-            self._last_sequence = sequence
 
         for update in updates:
             self.state.apply(update)
@@ -610,11 +625,18 @@ def external_depth_streams(
             url=coinbase_url,
             subscriptions=(
                 {"type": "subscribe", "product_ids": ["BTC-USD"], "channel": "level2"},
+                # Heartbeats keep sequence numbers flowing through quiet periods
+                # so a silent l2_data outage is detectable.
+                {"type": "subscribe", "product_ids": ["BTC-USD"], "channel": "heartbeats"},
             ),
             parser=_coinbase_depth,
             recorder=recorder,
             depth=depth,
             sample_hz=sample_hz,
+            enforce_sequence=True,
+            sequence_extractor=lambda row: (
+                int(row["sequence_num"]) if row.get("sequence_num") is not None else None
+            ),
             insecure_ssl=insecure_ssl,
             verbose=verbose,
         ),

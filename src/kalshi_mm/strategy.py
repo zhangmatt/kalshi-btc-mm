@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from .exchange import KalshiBbo, PriceGrid, event_contract_fee
+from .exchange import KalshiBbo, PriceGrid, maker_fee_rate
 
 
 @dataclass(frozen=True)
@@ -50,16 +50,23 @@ class KalshiStrategyConfig:
     inventory_skew_dollars: float = 0.02
     stale_after_ms: int = 2_000
     stop_quote_before_close_s: float = 90.0
-    maker_fee_multiplier: float = 0.0
+    # Conservative default: assume the standard 0.0175 maker rate applies to this
+    # series until verified against the fee schedule or a real fill.
+    maker_fee_multiplier: float = 1.0
     max_quote_notional_dollars: float = 10.0
     cash_reserve_dollars: float = 10.0
     min_order_count: float = 1.0
+    # Keep a partially filled order (and its queue priority) while its remaining
+    # size is at least this fraction of the desired size.
+    requote_remaining_fraction: float = 0.5
 
     def __post_init__(self) -> None:
         if self.base_count <= 0 or self.max_abs_position <= 0 or self.max_open_count <= 0:
             raise ValueError("order and position limits must be positive")
         if self.max_quote_notional_dollars <= 0 or self.cash_reserve_dollars < 0:
             raise ValueError("cash limits are invalid")
+        if not 0.0 < self.requote_remaining_fraction <= 1.0:
+            raise ValueError("requote_remaining_fraction must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -105,12 +112,7 @@ class KalshiMakerStrategy:
             bid_edge = self.config.min_edge_dollars + max(0.0, bid_toxicity_dollars)
             bid = self.price_grid.floor(reservation - bid_edge)
             bid = min(bid, self.price_grid.floor(bbo.ask - self.price_grid.step(bbo.ask)))
-            fee = event_contract_fee(
-                contracts=1.0,
-                price=bid,
-                maker=True,
-                maker_multiplier=self.config.maker_fee_multiplier,
-            )
+            fee = maker_fee_rate(price=bid, multiplier=self.config.maker_fee_multiplier)
             edge = reservation - bid - fee - max(0.0, bid_toxicity_dollars)
             bid_count = min(bid_count, self.config.max_quote_notional_dollars / max(0.001, bid))
             if 0.0 < bid < bbo.ask and edge >= self.config.min_edge_dollars - 1e-9:
@@ -122,12 +124,7 @@ class KalshiMakerStrategy:
             ask_edge = self.config.min_edge_dollars + max(0.0, ask_toxicity_dollars)
             ask = self.price_grid.ceil(reservation + ask_edge)
             ask = max(ask, self.price_grid.ceil(bbo.bid + self.price_grid.step(bbo.bid)))
-            fee = event_contract_fee(
-                contracts=1.0,
-                price=ask,
-                maker=True,
-                maker_multiplier=self.config.maker_fee_multiplier,
-            )
+            fee = maker_fee_rate(price=ask, multiplier=self.config.maker_fee_multiplier)
             edge = ask - reservation - fee - max(0.0, ask_toxicity_dollars)
             ask_collateral = max(0.001, 1.0 - ask)
             ask_count = min(ask_count, self.config.max_quote_notional_dollars / ask_collateral)
@@ -155,15 +152,20 @@ class KalshiMakerStrategy:
         plan = self._plan(current, desired)
         return KalshiStrategyDecision(fair_yes, reservation, plan, "quoting")
 
-    @staticmethod
-    def _plan(current: tuple[RestingKalshiOrder, ...], desired: list[KalshiQuote]) -> KalshiQuotePlan:
+    def _plan(self, current: tuple[RestingKalshiOrder, ...], desired: list[KalshiQuote]) -> KalshiQuotePlan:
         desired_by_side = {quote.side: quote for quote in desired}
         current_by_side = {order.side: order for order in current}
         cancel: list[str] = []
         post: list[KalshiQuote] = []
         for side, order in current_by_side.items():
             target = desired_by_side.get(side)
-            if target is None or abs(target.price - order.price) > 1e-9 or abs(target.count - order.remaining_count) > 1e-6:
+            if target is None or abs(target.price - order.price) > 1e-9:
+                cancel.append(order.order_id)
+                continue
+            # Cancel/repost forfeits queue priority, so tolerate a partially
+            # filled or slightly oversized resting order at the right price.
+            keep_floor = max(self.config.min_order_count, self.config.requote_remaining_fraction * target.count)
+            if order.remaining_count + 1e-9 < keep_floor:
                 cancel.append(order.order_id)
         for side, target in desired_by_side.items():
             order = current_by_side.get(side)

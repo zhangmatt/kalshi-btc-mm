@@ -232,8 +232,30 @@ def collect_one(
                 )
         if hold_feeds_until_rollover and deadline >= market.close_ts:
             # Keep BRTI and external references continuous while Kalshi computes and
-            # publishes the next market's opening strike.
-            _choose_market(client, None, wait=True, verbose=verbose)
+            # publishes the next market's opening strike. The recorder and stream
+            # must stay healthy through the hold, so this cannot block in
+            # _choose_market's bare wait loop.
+            announced_hold = False
+            while True:
+                recorder.check_health()
+                if stream.fatal_error:
+                    raise RuntimeError(stream.fatal_error)
+                try:
+                    now = time.time()
+                    candidates = [
+                        value for value in client.discover_btc15m(status="open") if value.close_ts > now
+                    ]
+                except Exception as exc:
+                    if verbose or not announced_hold:
+                        print(f"[collect] rollover discovery failed ({exc}); retrying", flush=True)
+                        announced_hold = True
+                    candidates = []
+                if candidates:
+                    break
+                if verbose or not announced_hold:
+                    print("[collect] holding feeds until the next market opens", flush=True)
+                    announced_hold = True
+                time.sleep(1.0)
     finally:
         stream.stop()
         for ref in refs:

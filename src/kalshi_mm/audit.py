@@ -36,6 +36,8 @@ class AuditResult:
     external_depth_venues: frozenset[str]
     event_counts: Counter[str]
     sequence_gaps: int
+    channel_seq_gaps: dict[str, int]
+    external_feed_issues: dict[str, int]
     invalid_rows: int
     gzip_complete: bool
     errors: tuple[str, ...]
@@ -65,6 +67,9 @@ def _scan(path: Path) -> dict[str, Any]:
         "context": set(),
         "depth_venues": set(),
         "collector_config": {},
+        "channel_seq": {},
+        "channel_seq_gaps": Counter(),
+        "external_status": Counter(),
     }
     try:
         with opener(path, "rt", encoding="utf-8") as handle:
@@ -102,6 +107,24 @@ def _scan(path: Path) -> dict[str, Any]:
                         state["depth_venues"].add(source)
                     if event_type in CONTEXT_EVENTS:
                         state["context"].add(event_type)
+                    if source == "kalshi":
+                        envelope = row.get("payload") or {}
+                        seq = envelope.get("seq")
+                        msg_type = str(envelope.get("type", ""))
+                        if seq is not None and msg_type in {
+                            "orderbook_delta", "orderbook_snapshot", "trade",
+                            "cfbenchmarks_value", "market_lifecycle_v2",
+                        }:
+                            channel = "orderbook" if msg_type.startswith("orderbook") else msg_type
+                            key = (channel, envelope.get("sid"))
+                            previous = state["channel_seq"].get(key)
+                            if previous is not None and int(seq) > previous + 1:
+                                state["channel_seq_gaps"][channel] += 1
+                            state["channel_seq"][key] = int(seq)
+                    if event_type == "external_book_status":
+                        status_value = str((row.get("payload") or {}).get("status", ""))
+                        if status_value in {"sequence_gap", "checksum_mismatch", "parse_error"}:
+                            state["external_status"][f"{source}:{status_value}"] += 1
             except EOFError:
                 state["gzip_complete"] = False
     except EOFError:
@@ -123,7 +146,7 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
         errors.append("recording contains no readable events")
         return AuditResult(
             path, "empty", 0, None, None, None, None, frozenset(), frozenset(), frozenset(), counts,
-            0, invalid_rows, gzip_complete, tuple(errors), tuple(warnings),
+            0, {}, {}, invalid_rows, gzip_complete, tuple(errors), tuple(warnings),
         )
 
     metadata = scan["metadata"]
@@ -166,6 +189,12 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
     sequence_gaps = counts["orderbook_sequence_gap"]
     if sequence_gaps:
         warnings.append(f"order book recovered from {sequence_gaps} sequence gap(s)")
+    channel_seq_gaps = dict(scan["channel_seq_gaps"])
+    for channel, gap_count in sorted(channel_seq_gaps.items()):
+        warnings.append(f"{channel} channel skipped {gap_count} sequence number(s)")
+    external_feed_issues = dict(scan["external_status"])
+    for issue, issue_count in sorted(external_feed_issues.items()):
+        warnings.append(f"external feed issue {issue} x{issue_count}")
     if invalid_rows:
         errors.append(f"recording contains {invalid_rows} invalid JSON row(s)")
 
@@ -184,7 +213,16 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
             errors.append(f"active recording is stale by {(now_ms - last_ts) / 1_000:.1f}s")
     else:
         status = "partial"
-        warnings.append("recording has no close marker")
+        if require_live:
+            # A live collector always either has an in-progress recording or a
+            # freshly closed one. A stale close-marker-less file as the newest
+            # recording means collection stopped; this must never PASS.
+            errors.append(
+                "collector appears dead: newest recording has no close marker and "
+                f"its last event is {(now_ms - last_ts) / 1_000:.1f}s old"
+            )
+        else:
+            warnings.append("recording has no close marker")
 
     if not gzip_complete and status != "in_progress":
         errors.append("gzip stream is truncated")
@@ -202,6 +240,8 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
         external_depth_venues=frozenset(depth_venues),
         event_counts=counts,
         sequence_gaps=sequence_gaps,
+        channel_seq_gaps=channel_seq_gaps,
+        external_feed_issues=external_feed_issues,
         invalid_rows=invalid_rows,
         gzip_complete=gzip_complete,
         errors=tuple(errors),

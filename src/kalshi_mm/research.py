@@ -5,13 +5,16 @@ import bisect
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from .exchange import BrtiState, KalshiMarket, KalshiOrderBook
 from .recorder import iter_events
+from .replay import extract_brti_ticks
 from .settlement import infer_settlement
 from .fair_value import kalshi_btc15m_fair_value
 from .volatility import MultiHorizonVolatility
+
+VOL_PREWARM_WINDOW_MS = 3_600_000
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,24 @@ class Prediction:
     ts_ms: int
     mid: float
     fairs: dict[str, float]
+
+
+@dataclass(frozen=True)
+class WindowQuality:
+    ticker: str
+    paths: tuple[str, ...]
+    fragments: int
+    start_offset_s: Optional[float]
+    brti_max_gap_s: float
+    kalshi_reconnects: int
+    flags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedWindow:
+    market: KalshiMarket
+    rows: tuple[dict[str, Any], ...]
+    quality: WindowQuality
 
 
 @dataclass(frozen=True)
@@ -74,17 +95,92 @@ def _future_hit_rate(predictions: list[Prediction], model: str, horizon_ms: int)
     return hits / samples if samples else None
 
 
-def _recording_predictions(path: str | Path) -> tuple[list[Prediction], Optional[float]]:
-    rows = list(iter_events(path))
-    metadata = next((row["payload"] for row in rows if row["event_type"] == "market_metadata"), None)
-    if metadata is None:
-        raise ValueError(f"{path} has no market metadata")
-    market = KalshiMarket.from_api(metadata)
+def prepare_windows(paths: Iterable[str | Path]) -> list[PreparedWindow]:
+    """Group recording fragments by market so one market is exactly one window."""
+    groups: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        rows = list(iter_events(path))
+        metadata = next((row["payload"] for row in rows if row["event_type"] == "market_metadata"), None)
+        if metadata is None:
+            raise ValueError(f"{path} has no market metadata")
+        market = KalshiMarket.from_api(metadata)
+        group = groups.setdefault(market.ticker, {"market": market, "files": []})
+        group["files"].append((str(path), rows))
+
+    windows: list[PreparedWindow] = []
+    for group in groups.values():
+        market: KalshiMarket = group["market"]
+        files = sorted(
+            group["files"],
+            key=lambda item: min((int(row["receive_ts_ms"]) for row in item[1]), default=0),
+        )
+        rows = tuple(row for _, file_rows in files for row in file_rows)
+        windows.append(
+            PreparedWindow(
+                market=market,
+                rows=rows,
+                quality=_window_quality(market, rows, tuple(path for path, _ in files)),
+            )
+        )
+    windows.sort(key=lambda window: window.market.open_ts)
+    return windows
+
+
+def _window_quality(
+    market: KalshiMarket,
+    rows: tuple[dict[str, Any], ...],
+    paths: tuple[str, ...],
+) -> WindowQuality:
+    open_ms = market.open_ts * 1_000
+    close_ms = market.close_ts * 1_000
+    first_ts = min((int(row["receive_ts_ms"]) for row in rows), default=None)
+    start_offset = (first_ts - open_ms) / 1_000 if first_ts is not None else None
+    brti_ts = [ts for ts, _ in extract_brti_ticks(rows) if open_ms <= ts <= close_ms]
+    brti_max_gap = max(
+        ((later - earlier) / 1_000 for earlier, later in zip(brti_ts, brti_ts[1:])),
+        default=0.0,
+    )
+    reconnects = sum(
+        1
+        for row in rows
+        if row.get("source") == "kalshi"
+        and row.get("event_type") == "feed_status"
+        and (row.get("payload") or {}).get("status") == "connected"
+    )
+    reconnects = max(0, reconnects - len(paths))  # one connect per fragment is expected
+    flags: list[str] = []
+    if len(paths) > 1:
+        flags.append("fragmented")
+    if brti_max_gap > 5.0:
+        flags.append("brti_gap")
+    if reconnects > 0:
+        flags.append("reconnect")
+    if start_offset is not None and start_offset > 120.0:
+        flags.append("late_start")
+    return WindowQuality(
+        ticker=market.ticker,
+        paths=paths,
+        fragments=len(paths),
+        start_offset_s=start_offset,
+        brti_max_gap_s=brti_max_gap,
+        kalshi_reconnects=reconnects,
+        flags=tuple(flags),
+    )
+
+
+def _window_predictions(
+    window: PreparedWindow,
+    prewarm_ticks: list[tuple[int, float]],
+) -> tuple[list[Prediction], Optional[float]]:
+    market = window.market
+    rows = window.rows
     settlement = infer_settlement(rows, market)
     outcome = 1.0 if settlement and settlement.result == "yes" else 0.0 if settlement else None
     book = KalshiOrderBook(market.ticker)
     brti = BrtiState()
     volatility = MultiHorizonVolatility()
+    for ts_ms, value in prewarm_ticks:
+        volatility.update(ts_ms, value)
     latest_venues: dict[str, tuple[int, float]] = {}
     predictions: list[Prediction] = []
     last_emit_ms = 0
@@ -145,8 +241,19 @@ def _recording_predictions(path: str | Path) -> tuple[list[Prediction], Optional
     return predictions, outcome
 
 
-def score_recordings(paths: Iterable[str | Path]) -> list[ModelScore]:
-    windows = [_recording_predictions(path) for path in paths]
+def score_windows(prepared: list[PreparedWindow], *, strict: bool = False) -> list[ModelScore]:
+    """Score models per market window, warming volatility from prior windows' BRTI."""
+    windows: list[tuple[list[Prediction], Optional[float]]] = []
+    prior_ticks: list[tuple[int, float]] = []
+    for window in prepared:
+        first_ts = min((int(row["receive_ts_ms"]) for row in window.rows), default=0)
+        prewarm = [tick for tick in prior_ticks if first_ts - VOL_PREWARM_WINDOW_MS <= tick[0] < first_ts]
+        if not (strict and window.quality.flags):
+            windows.append(_window_predictions(window, prewarm))
+        prior_ticks.extend(extract_brti_ticks(window.rows))
+        cutoff = first_ts - VOL_PREWARM_WINDOW_MS
+        prior_ticks = [tick for tick in prior_ticks if tick[0] >= cutoff]
+
     model_names = sorted({name for predictions, _ in windows for row in predictions for name in row.fairs})
     scores = []
     for model in model_names:
@@ -186,14 +293,36 @@ def score_recordings(paths: Iterable[str | Path]) -> list[ModelScore]:
     return scores
 
 
+def score_recordings(paths: Iterable[str | Path], *, strict: bool = False) -> list[ModelScore]:
+    return score_windows(prepare_windows(paths), strict=strict)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Compare Kalshi settlement-vol and basis models.")
     parser.add_argument("recordings", nargs="+")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exclude windows flagged for BRTI gaps, reconnects, or very late starts",
+    )
     args = parser.parse_args(argv)
+    prepared = prepare_windows(args.recordings)
+    print("# window quality (one market = one window)")
+    for window in prepared:
+        quality = window.quality
+        print(
+            f"# {quality.ticker} fragments={quality.fragments} "
+            f"start_offset_s={quality.start_offset_s if quality.start_offset_s is not None else 'n/a'} "
+            f"brti_max_gap_s={quality.brti_max_gap_s:.1f} reconnects={quality.kalshi_reconnects} "
+            f"flags={','.join(quality.flags) or '-'}"
+        )
+    excluded = [window.quality.ticker for window in prepared if args.strict and window.quality.flags]
+    if excluded:
+        print(f"# excluded {len(excluded)} flagged window(s): {', '.join(excluded)}")
     horizons = (100, 500, 1_000, 5_000, 30_000)
     suffixes = [f"ic_{horizon}ms" for horizon in horizons] + [f"hit_{horizon}ms" for horizon in horizons]
     print(",".join(["model", "samples", "windows", "brier", "log_loss", "mae_fair_mid", *suffixes]))
-    for score in score_recordings(args.recordings):
+    for score in score_windows(prepared, strict=args.strict):
         values = [
             score.model,
             str(score.samples),

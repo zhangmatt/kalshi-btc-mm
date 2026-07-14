@@ -1,4 +1,7 @@
-from kalshi_mm.replay import ConservativeQueueSimulator
+import json
+
+from kalshi_mm.recorder import EventRecorder
+from kalshi_mm.replay import ConservativeQueueSimulator, replay
 from kalshi_mm.strategy import KalshiQuote
 
 
@@ -7,6 +10,94 @@ class Bbo:
     ask = 0.51
     bid_size = 10
     ask_size = 12
+
+
+def _write_latency_fixture(path) -> None:
+    start_s = 1_800_000_000
+    metadata = {
+        "ticker": "KXBTC15M-TEST",
+        "event_ticker": "KXBTC15M-TEST",
+        "title": "BTC price up in next 15 mins?",
+        "status": "active",
+        "open_time": "2027-01-15T08:00:00+00:00",
+        "close_time": "2027-01-15T08:15:00+00:00",
+        "expected_expiration_time": "2027-01-15T08:20:00+00:00",
+        "floor_strike": 100.0,
+        "price_ranges": [{"start": 0, "end": 1, "step": 0.01}],
+        "rules_primary": "test",
+        "rules_secondary": "test",
+        "result": "",
+    }
+    with EventRecorder(path) as recorder:
+        recorder.write(
+            source="system", event_type="market_metadata", payload=metadata, receive_ts_ms=start_s * 1000
+        )
+        recorder.write(
+            source="kalshi",
+            event_type="orderbook_snapshot",
+            payload={
+                "type": "orderbook_snapshot",
+                "seq": 1,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes_dollars_fp": [["0.40", "5"]],
+                    "no_dollars_fp": [["0.60", "5"]],
+                },
+            },
+            receive_ts_ms=start_s * 1000,
+        )
+        def brti(ts_ms: int) -> None:
+            recorder.write(
+                source="kalshi",
+                event_type="cfbenchmarks_value",
+                payload={
+                    "type": "cfbenchmarks_value",
+                    "msg": {"index_id": "BRTI", "data": json.dumps({"time": ts_ms, "value": "100.0"})},
+                },
+                exchange_ts_ms=ts_ms,
+                receive_ts_ms=ts_ms,
+            )
+
+        def trade(ts_ms: int) -> None:
+            recorder.write(
+                source="kalshi",
+                event_type="trade",
+                payload={
+                    "type": "trade",
+                    "msg": {
+                        "market_ticker": "KXBTC15M-TEST",
+                        # At the strike the lognormal fair sits a hair under 0.5,
+                        # so the strategy bids 0.48; print through that level.
+                        "yes_price_dollars": "0.48",
+                        "count_fp": "10",
+                        "taker_book_side": "ask",
+                        "ts_ms": ts_ms,
+                    },
+                },
+                exchange_ts_ms=ts_ms,
+                receive_ts_ms=ts_ms,
+            )
+
+        # The volatility forecast first resolves at +3000, producing the first
+        # decision there (pending activation at +3150 with 150ms latency).
+        for second in range(4):
+            brti(start_s * 1000 + second * 1000)
+        # 100ms after the decision: inside the latency window.
+        trade(start_s * 1000 + 3_100)
+        # This tick is past the activation time, so pending orders join the book.
+        brti(start_s * 1000 + 4_000)
+        trade(start_s * 1000 + 4_100)
+
+
+def test_replay_latency_delays_order_activation(tmp_path):
+    path = tmp_path / "events.jsonl"
+    _write_latency_fixture(path)
+    delayed = replay(path, latency_ms=150, maker_fee_multiplier=0.0)
+    instant = replay(path, latency_ms=0, maker_fee_multiplier=0.0)
+    # With latency, the +3.1s trade lands before activation; only the +4.1s trade fills.
+    assert delayed.fills and delayed.fills[0].ts_ms == 1_800_000_000 * 1000 + 4_100
+    assert instant.fills and instant.fills[0].ts_ms == 1_800_000_000 * 1000 + 3_100
+    assert delayed.latency_ms == 150
 
 
 def test_queue_simulator_requires_trades_to_clear_queue_ahead():

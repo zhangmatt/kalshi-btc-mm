@@ -128,3 +128,44 @@ def test_retention_preserves_local_copy_when_remote_verification_fails(tmp_path)
     assert freed == 0
     assert path.exists()
     assert marker_path(path).exists()
+
+
+def test_runner_recordings_are_ready_once_finalized(tmp_path):
+    # Runner files never contain market_status_at_close.
+    path = tmp_path / "TICKER" / "runner_x.jsonl.gz"
+    _recording(path, "market_result")
+    config = _config(tmp_path)
+    assert recording_is_ready(path, config, path.stat().st_mtime + 1)
+    unfinalized = tmp_path / "TICKER" / "runner_y.jsonl.gz"
+    _recording(unfinalized, "market_metadata")
+    assert not recording_is_ready(unfinalized, config, unfinalized.stat().st_mtime + 1)
+
+
+class FailingS3(FakeS3):
+    def __init__(self, fail_key_fragment: str):
+        super().__init__()
+        self.fail_key_fragment = fail_key_fragment
+
+    def put_object(self, *, Bucket, Key, **kwargs):
+        if self.fail_key_fragment in Key:
+            raise RuntimeError("simulated S3 outage for this key")
+        super().put_object(Bucket=Bucket, Key=Key, **kwargs)
+
+
+def test_upload_failure_does_not_block_later_files(tmp_path):
+    import os
+
+    from kalshi_mm.archive import archive_ready
+
+    first = tmp_path / "A" / "events_a.jsonl.gz"
+    second = tmp_path / "B" / "events_b.jsonl.gz"
+    _recording(first, "market_status_at_close", "market_result")
+    _recording(second, "market_status_at_close", "market_result")
+    os.utime(first, ns=(1, 1))  # force first in mtime order
+    config = _config(tmp_path)
+    s3 = FailingS3("events_a")
+    uploaded, skipped, failed = archive_ready(config, s3, now=second.stat().st_mtime + 1)
+    assert failed == 1
+    assert uploaded == 1
+    assert marker_path(second).exists()
+    assert not marker_path(first).exists()

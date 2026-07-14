@@ -143,7 +143,9 @@ def implied_sigma_from_mid(
         return None
     numerator = math.log(spot / s0) + drift_per_s * time_remaining_s
     denominator = z * math.sqrt(time_remaining_s)
-    sigma = abs(numerator / denominator)
+    sigma = numerator / denominator
+    # A sign mismatch (e.g. p > 0.5 while spot < s0) has no consistent GBM sigma;
+    # taking abs() here would fabricate one.
     return sigma if sigma > 0 else None
 
 

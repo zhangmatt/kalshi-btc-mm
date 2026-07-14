@@ -129,3 +129,64 @@ def test_kraken_parser_and_checksum_match_official_example():
     state = ExternalBookState(10, truncate_to_depth=True)
     state.apply(update)
     assert state.kraken_checksum() == 3310070434
+
+
+class _FakeWs:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_coinbase_sequence_gap_resets_book_and_reconnects(tmp_path):
+    import json
+
+    from kalshi_mm.feeds import ExternalBookStream
+    from kalshi_mm.recorder import EventRecorder, iter_events
+
+    log = tmp_path / "events.jsonl"
+    recorder = EventRecorder(log)
+    stream = ExternalBookStream(
+        venue="coinbase",
+        symbol="BTC-USD",
+        url="wss://unused",
+        subscriptions=(),
+        parser=_coinbase_depth,
+        recorder=recorder,
+        depth=10,
+        sample_hz=10.0,
+        enforce_sequence=True,
+        sequence_extractor=lambda row: (
+            int(row["sequence_num"]) if row.get("sequence_num") is not None else None
+        ),
+    )
+    stream._ws = _FakeWs()
+    snapshot = {
+        "channel": "l2_data",
+        "timestamp": "2026-07-14T01:02:03.456Z",
+        "sequence_num": 0,
+        "events": [
+            {
+                "type": "snapshot",
+                "updates": [
+                    {"side": "bid", "price_level": "100", "new_quantity": "1"},
+                    {"side": "offer", "price_level": "101", "new_quantity": "1"},
+                ],
+            }
+        ],
+    }
+    stream._on_message(None, json.dumps(snapshot))
+    assert stream.state.initialized
+    stream._on_message(None, json.dumps({"channel": "heartbeats", "sequence_num": 1}))
+    assert stream.state.initialized
+    # A skipped connection-level sequence number means lost data: reset + reconnect.
+    stream._on_message(None, json.dumps({"channel": "heartbeats", "sequence_num": 3}))
+    assert stream._ws.closed
+    assert not stream.state.initialized
+    recorder.close()
+    events = list(iter_events(log))
+    assert any(
+        row["event_type"] == "external_book_status" and row["payload"]["status"] == "sequence_gap"
+        for row in events
+    )

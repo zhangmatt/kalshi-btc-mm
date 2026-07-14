@@ -107,7 +107,11 @@ def recording_is_ready(path: Path, config: ArchiveConfig, now: Optional[float] =
     if age < config.stable_age_s:
         return False
     state = inspect_recording(path)
-    if not state.readable or not state.closed:
+    if not state.readable:
+        return False
+    # Runner recordings never contain market_status_at_close; the collector's
+    # events_* files must, or they are still being written.
+    if path.name.startswith("events_") and not state.closed:
         return False
     return state.finalized or age >= config.settlement_grace_s
 
@@ -214,27 +218,36 @@ def upload_recording(path: Path, config: ArchiveConfig, s3: Any) -> UploadMarker
 
 
 def recordings(data_dir: Path) -> list[Path]:
-    return sorted(data_dir.glob("**/events_*.jsonl.gz"), key=lambda value: value.stat().st_mtime)
+    paths = list(data_dir.glob("**/events_*.jsonl.gz")) + list(data_dir.glob("**/runner_*.jsonl.gz"))
+    return sorted(paths, key=lambda value: value.stat().st_mtime)
 
 
-def archive_ready(config: ArchiveConfig, s3: Any, *, now: Optional[float] = None) -> tuple[int, int]:
+def archive_ready(config: ArchiveConfig, s3: Any, *, now: Optional[float] = None) -> tuple[int, int, int]:
     now = time.time() if now is None else now
     uploaded = 0
     skipped = 0
+    failed = 0
     for path in recordings(config.data_dir):
         if _verified_marker(path, config):
             skipped += 1
             continue
         if not recording_is_ready(path, config, now):
             continue
-        marker = upload_recording(path, config, s3)
+        try:
+            marker = upload_recording(path, config, s3)
+        except Exception as exc:
+            # One bad file must not block every later file; the health check
+            # alarms on any persistent backlog.
+            failed += 1
+            print(f"[archive] upload failed for {path}: {exc}", flush=True)
+            continue
         uploaded += 1
         print(
             f"[archive] uploaded bytes={marker.size} sha256={marker.sha256[:12]} "
             f"s3://{marker.bucket}/{marker.key}",
             flush=True,
         )
-    return uploaded, skipped
+    return uploaded, skipped, failed
 
 
 def _delete_local(path: Path, marker: UploadMarker, *, reason: str) -> int:
@@ -330,13 +343,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.health:
         health_check(config, s3)
         return
-    uploaded, skipped = archive_ready(config, s3)
+    uploaded, skipped, failed = archive_ready(config, s3)
     deleted, freed = apply_retention(config, s3)
     print(
-        f"[archive] complete uploaded={uploaded} already_uploaded={skipped} "
+        f"[archive] complete uploaded={uploaded} already_uploaded={skipped} failed={failed} "
         f"deleted={deleted} freed_bytes={freed}",
         flush=True,
     )
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

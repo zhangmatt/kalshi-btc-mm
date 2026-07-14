@@ -314,19 +314,40 @@ def build_order(
     return order
 
 
+MAKER_FEE_RATE = Decimal("0.0175")
+TAKER_FEE_RATE = Decimal("0.07")
+
+
 def event_contract_fee(
     *,
     contracts: float,
     price: float,
     maker: bool,
-    maker_multiplier: float = 0.0,
+    maker_multiplier: float = 1.0,
     taker_multiplier: float = 1.0,
 ) -> float:
+    """Kalshi quadratic fee, rounded up to the next cent per the published schedule.
+
+    The maker rate for CRYPTO15M is assumed at the standard 0.0175 multiplier until
+    verified against the fee schedule or a real fill; override with maker_multiplier=0
+    if the series turns out to be maker-fee-free.
+    """
     multiplier = Decimal(str(maker_multiplier if maker else taker_multiplier))
-    rate = Decimal("0.0175") if maker else Decimal("0.07")
+    rate = MAKER_FEE_RATE if maker else TAKER_FEE_RATE
     probability = Decimal(str(price))
     raw = multiplier * rate * Decimal(str(contracts)) * probability * (Decimal("1") - probability)
-    return float(max(Decimal("0"), raw).quantize(Decimal("0.0001"), rounding=ROUND_CEILING))
+    return float(max(Decimal("0"), raw).quantize(Decimal("0.01"), rounding=ROUND_CEILING))
+
+
+def maker_fee_rate(*, price: float, multiplier: float = 1.0) -> float:
+    """Unrounded per-contract maker fee for edge estimation.
+
+    The charged fee rounds up to the cent per order (event_contract_fee); using
+    that rounding on a single contract would overstate the marginal cost.
+    """
+    probability = Decimal(str(price))
+    raw = Decimal(str(multiplier)) * MAKER_FEE_RATE * probability * (Decimal("1") - probability)
+    return float(max(Decimal("0"), raw))
 
 
 @dataclass(frozen=True)

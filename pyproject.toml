@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kalshi-btc-mm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Settlement-aware research and maker execution for Kalshi KXBTC15M markets."
 readme = "README.md"
 requires-python = ">=3.10"

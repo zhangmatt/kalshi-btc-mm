@@ -45,6 +45,27 @@ def test_final_minute_conditions_on_observed_average():
     assert low.yes < 0.01
 
 
+def test_expiry_with_partial_observations_assumes_spot_for_missing():
+    high = kalshi_btc15m_fair_value(
+        strike_average=100.0,
+        spot=100.0,
+        sigma_per_s=1e-4,
+        seconds_to_close=0.0,
+        observed_final_values=[100.5] * 30,
+    )
+    assert high.yes == 1.0  # (30*100.5 + 30*100.0) / 60 = 100.25 >= 100
+    assert high.expected_average == pytest.approx(100.25)
+    low = kalshi_btc15m_fair_value(
+        strike_average=100.0,
+        spot=99.5,
+        sigma_per_s=1e-4,
+        seconds_to_close=0.0,
+        observed_final_values=[99.0] * 30,
+    )
+    assert low.yes == 0.0
+    assert low.expected_average == pytest.approx(99.25)
+
+
 def test_pre_window_fixings_are_in_final_minute():
     result = kalshi_btc15m_fair_value(
         strike_average=100.0,

@@ -10,6 +10,7 @@ from kalshi_mm.exchange import (
     PriceRange,
     build_order,
     event_contract_fee,
+    maker_fee_rate,
 )
 
 
@@ -98,7 +99,13 @@ def test_brti_state_uses_published_partial_average_and_count():
 
 def test_fee_and_post_only_order_shape():
     assert event_contract_fee(contracts=100, price=0.5, maker=False) == 1.75
-    assert event_contract_fee(contracts=100, price=0.5, maker=True) == 0.0
+    # Charged fees round UP to the next cent, matching Kalshi's schedule.
+    assert event_contract_fee(contracts=100, price=0.5, maker=True) == 0.44
+    assert event_contract_fee(contracts=1, price=0.5, maker=True) == 0.01
+    assert event_contract_fee(contracts=100, price=0.5, maker=True, maker_multiplier=0.0) == 0.0
+    # Edge estimation uses the unrounded marginal rate.
+    assert maker_fee_rate(price=0.5) == pytest.approx(0.004375)
+    assert maker_fee_rate(price=0.5, multiplier=0.0) == 0.0
     order = build_order(ticker="T", side="bid", price=0.5, count=5, expiration_time=123)
     assert order["post_only"] is True
     assert order["cancel_order_on_pause"] is True

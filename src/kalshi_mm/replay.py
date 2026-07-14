@@ -95,6 +95,8 @@ class ReplayResult:
     final_position: float
     cash_flow: float
     fees_paid: float
+    latency_ms: int
+    maker_fee_multiplier: float
     gross_fair_edge: float
     markout_1s: Optional[float]
     markout_5s: Optional[float]
@@ -121,7 +123,33 @@ def _markout(fills: list[ReplayFill], mids: list[tuple[int, float]], horizon_ms:
     return total / contracts if contracts > 0 else None
 
 
-def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
+def extract_brti_ticks(rows: Iterable[Any]) -> list[tuple[int, float]]:
+    """BRTI (ts_ms, value) observations from recorded rows, for volatility prewarm."""
+    state = BrtiState()
+    ticks: list[tuple[int, float]] = []
+    for row in rows:
+        payload = row.get("payload") or {}
+        if row.get("source") == "kalshi" and state.apply(payload) and state.value is not None:
+            ticks.append((state.source_ts_ms or int(row["receive_ts_ms"]), state.value))
+    return ticks
+
+
+def replay(
+    path: str | Path,
+    *,
+    min_edge_dollars: float = 0.01,
+    latency_ms: int = 150,
+    maker_fee_multiplier: float = 1.0,
+    prewarm_paths: tuple[str | Path, ...] = (),
+) -> ReplayResult:
+    """Queue-aware replay with a feed-to-matching-engine latency model.
+
+    Every plan the strategy produces activates latency_ms after the decision:
+    new orders join the queue against the book as of activation, and cancelled
+    orders remain fillable until the cancel activates.
+    """
+    if latency_ms < 0:
+        raise ValueError("latency_ms cannot be negative")
     rows = list(iter_events(path))
     metadata = next((row["payload"] for row in rows if row["event_type"] == "market_metadata"), None)
     if metadata is None:
@@ -131,9 +159,15 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
     book = KalshiOrderBook(market.ticker)
     brti = BrtiState()
     vol = MultiHorizonVolatility()
+    for prewarm_path in prewarm_paths:
+        for ts_ms, value in extract_brti_ticks(iter_events(prewarm_path)):
+            vol.update(ts_ms, value)
     strategy = KalshiMakerStrategy(
         price_grid=PriceGrid(market.price_ranges),
-        config=KalshiStrategyConfig(min_edge_dollars=min_edge_dollars),
+        config=KalshiStrategyConfig(
+            min_edge_dollars=min_edge_dollars,
+            maker_fee_multiplier=maker_fee_multiplier,
+        ),
     )
     simulator = ConservativeQueueSimulator()
     inventory = KalshiInventory()
@@ -147,6 +181,7 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
     cash_flow = 0.0
     fees_paid = 0.0
     gross_fair_edge = 0.0
+    pending_plan: Optional[tuple[int, Any]] = None
 
     for row in rows:
         ts_ms = int(row["receive_ts_ms"])
@@ -159,6 +194,14 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
         if ts_ms / 1000.0 > market.close_ts:
             continue
         bbo = book.snapshot()
+
+        if pending_plan is not None and ts_ms >= pending_plan[0]:
+            plan = pending_plan[1]
+            simulator.replace(cancel_ids=plan.cancel_ids, quotes=plan.post, bbo=bbo, book=book)
+            orders_posted += len(plan.post)
+            contracts_posted += sum(quote.count for quote in plan.post)
+            pending_plan = None
+
         forecast = vol.forecast()
         if bbo.valid and brti.value is not None and forecast is not None:
             seconds_to_close = max(0.0, market.close_ts - ts_ms / 1000.0)
@@ -176,19 +219,19 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
                 fair_mid_diffs.append(abs(fair.yes - mid))
                 if not mids or mids[-1] != (ts_ms, mid):
                     mids.append((ts_ms, mid))
-            decision = strategy.decide(
-                fair_yes=fair.yes,
-                bbo=bbo,
-                inventory=inventory,
-                current_orders=simulator.resting(),
-                seconds_to_close=seconds_to_close,
-                data_age_ms=0,
-            )
-            if decision.plan.changed:
-                simulator.replace(cancel_ids=decision.plan.cancel_ids, quotes=decision.plan.post, bbo=bbo, book=book)
-                orders_posted += len(decision.plan.post)
-                contracts_posted += sum(quote.count for quote in decision.plan.post)
-            decisions += 1
+            # While a cancel/replace is in flight, live execution cannot issue another.
+            if pending_plan is None:
+                decision = strategy.decide(
+                    fair_yes=fair.yes,
+                    bbo=bbo,
+                    inventory=inventory,
+                    current_orders=simulator.resting(),
+                    seconds_to_close=seconds_to_close,
+                    data_age_ms=0,
+                )
+                if decision.plan.changed:
+                    pending_plan = (ts_ms + latency_ms, decision.plan)
+                decisions += 1
 
         if payload.get("type") == "trade":
             msg = payload.get("msg") or {}
@@ -207,7 +250,12 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
                 for fill in new_fills:
                     delta = fill.count if fill.side == "bid" else -fill.count
                     inventory = KalshiInventory(position=inventory.position + delta)
-                    fee = event_contract_fee(contracts=fill.count, price=fill.price, maker=True)
+                    fee = event_contract_fee(
+                        contracts=fill.count,
+                        price=fill.price,
+                        maker=True,
+                        maker_multiplier=maker_fee_multiplier,
+                    )
                     fees_paid += fee
                     cash_flow += (-fill.price * fill.count if fill.side == "bid" else fill.price * fill.count) - fee
                     gross_fair_edge += (
@@ -230,6 +278,8 @@ def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
         final_position=inventory.position,
         cash_flow=cash_flow,
         fees_paid=fees_paid,
+        latency_ms=latency_ms,
+        maker_fee_multiplier=maker_fee_multiplier,
         gross_fair_edge=gross_fair_edge,
         markout_1s=_markout(fills, mids, 1_000),
         markout_5s=_markout(fills, mids, 5_000),
@@ -245,8 +295,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Replay a Kalshi BTC 15m recording conservatively.")
     parser.add_argument("recording")
     parser.add_argument("--min-edge", type=float, default=0.01)
+    parser.add_argument("--latency-ms", type=int, default=150, help="decision-to-matching-engine latency")
+    parser.add_argument(
+        "--maker-fee-multiplier",
+        type=float,
+        default=1.0,
+        help="0 disables maker fees; 1 applies the standard 0.0175 quadratic rate (unverified for CRYPTO15M)",
+    )
+    parser.add_argument(
+        "--prewarm",
+        action="append",
+        default=[],
+        help="prior recording(s) whose BRTI warms the volatility estimator",
+    )
     args = parser.parse_args(argv)
-    result = replay(args.recording, min_edge_dollars=args.min_edge)
+    result = replay(
+        args.recording,
+        min_edge_dollars=args.min_edge,
+        latency_ms=args.latency_ms,
+        maker_fee_multiplier=args.maker_fee_multiplier,
+        prewarm_paths=tuple(args.prewarm),
+    )
+    print(f"latency_ms={result.latency_ms} maker_fee_multiplier={result.maker_fee_multiplier}")
     print(f"decisions={result.decisions}")
     print(f"orders_posted={result.orders_posted}")
     print(f"fills={len(result.fills)}")

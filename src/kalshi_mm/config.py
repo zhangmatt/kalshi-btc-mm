@@ -28,6 +28,7 @@ class KalshiRuntimeConfig:
     subaccount: int = 0
     position_poll_s: float = 1.0
     order_reconcile_s: float = 1.0
+    quote_throttle_s: float = 0.25
     allow_proxy_pricing: bool = False
     ws_insecure: bool = False
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
@@ -61,10 +62,11 @@ class KalshiRuntimeConfig:
             inventory_skew_dollars=float(env.get("KALSHI_INVENTORY_SKEW_DOLLARS", "0.02")),
             stale_after_ms=int(env.get("KALSHI_STALE_AFTER_MS", "2000")),
             stop_quote_before_close_s=float(env.get("KALSHI_CLOSE_CUTOFF_S", "90")),
-            maker_fee_multiplier=float(env.get("KALSHI_MAKER_FEE_MULTIPLIER", "0")),
+            maker_fee_multiplier=float(env.get("KALSHI_MAKER_FEE_MULTIPLIER", "1")),
             max_quote_notional_dollars=float(env.get("KALSHI_MAX_QUOTE_NOTIONAL_DOLLARS", "10")),
             cash_reserve_dollars=float(env.get("KALSHI_CASH_RESERVE_DOLLARS", "10")),
             min_order_count=float(env.get("KALSHI_MIN_ORDER_COUNT", "1")),
+            requote_remaining_fraction=float(env.get("KALSHI_REQUOTE_REMAINING_FRACTION", "0.5")),
         )
         return cls(
             environment=environment,
@@ -74,6 +76,7 @@ class KalshiRuntimeConfig:
             subaccount=int(env.get("KALSHI_SUBACCOUNT", "0")),
             position_poll_s=float(env.get("KALSHI_POSITION_POLL_S", "1.0")),
             order_reconcile_s=float(env.get("KALSHI_ORDER_RECONCILE_S", "1.0")),
+            quote_throttle_s=float(env.get("KALSHI_QUOTE_THROTTLE_S", "0.25")),
             allow_proxy_pricing=_bool(env, "KALSHI_ALLOW_PROXY_PRICING", False),
             ws_insecure=_bool(env, "KALSHI_WS_INSECURE", _bool(env, "WS_INSECURE", False)),
             binance_ws_url=binance_ws_url,

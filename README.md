@@ -56,6 +56,15 @@ External L2 collection defaults to ten levels sampled at no more than 10 Hz per 
 with `KALSHI_EXTERNAL_DEPTH_ENABLED`, `KALSHI_EXTERNAL_DEPTH_LEVELS`, and
 `KALSHI_EXTERNAL_DEPTH_SAMPLE_HZ`. Depth is research data and is not used by live quotes by default.
 
+## Fees
+
+All maker-edge math and simulated fills assume the standard 0.0175 quadratic maker
+rate (`KALSHI_MAKER_FEE_MULTIPLIER=1`, ceil-to-cent on charged fees). **This has not
+been verified against the published fee schedule for CRYPTO15M** — confirm it from
+the fee schedule PDF or a real fill before trusting absolute P&L numbers, and set
+the multiplier to 0 only if the series is confirmed maker-fee-free. Taker fees use
+the standard 0.07 rate.
+
 ## Collect And Analyze
 
 ```bash
@@ -63,6 +72,15 @@ kalshi-mm-collect --windows 1 --verbose
 kalshi-mm-replay data/kalshi/<ticker>/events_<run>.jsonl.gz
 kalshi-mm-research data/kalshi/*/events_*.jsonl.gz
 ```
+
+Replay models decision-to-matching-engine latency (`--latency-ms`, default 150):
+orders join the queue only after the delay, and cancelled orders remain fillable
+until the cancel activates. `--prewarm <prior recording>` warms the volatility
+estimator from the previous window's BRTI so the first minutes are not blind.
+
+Research groups recording fragments by market ticker (one market = one window),
+warms volatility across consecutive windows, and prints per-window quality flags
+(fragments, BRTI gaps, reconnects). `--strict` excludes flagged windows.
 
 Continuous collection rolls to the next market at close and finalizes outcomes asynchronously:
 
@@ -74,7 +92,8 @@ Finalized gzip recordings can be checksum-verified into private S3 storage while
 days locally. The uploader never deletes an active or unverified file. See `docs/s3-archive.md` and
 the systemd units under `deploy/`.
 
-Paper quoting reads production data but does not place orders:
+Paper quoting reads production data and simulates queue-aware fills from the live
+trade tape (recorded as `paper_fill` events with fees) but does not place orders:
 
 ```bash
 kalshi-mm-run --windows 1 --verbose

@@ -92,9 +92,14 @@ def kalshi_btc15m_fair_value(
     observed_sum = sum(observed)
 
     if remaining == 0 or seconds_to_close <= 0:
-        average = observed_sum / fixings if observed else spot
+        if remaining == 0:
+            average = observed_sum / fixings if observed else spot
+        else:
+            # Time exhausted with missing fixings: the unobserved fixings settle at
+            # (approximately) the current spot, not zero.
+            average = (observed_sum + remaining * spot) / fixings
         yes = 1.0 if average >= strike_average else 0.0
-        return SettlementFairValue(yes, 1.0 - yes, average, 0.0, len(observed), 0)
+        return SettlementFairValue(yes, 1.0 - yes, average, 0.0, len(observed), remaining if seconds_to_close <= 0 else 0)
 
     fixing_times = _future_fixing_times(
         seconds_to_close,
