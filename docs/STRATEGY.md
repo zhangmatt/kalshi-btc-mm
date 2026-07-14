@@ -236,3 +236,11 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
   all prior zero-fee results invalidated.
 - **2026-07-14** — 150ms latency became the replay default; zero-latency results
   invalidated for promotion purposes.
+- **2026-07-14 (later)** — P2 tooling complete ahead of data: feature store
+  (`kalshi-mm-features` + 5-min compaction timer on the collector host), Model T
+  label pipeline (`kalshi-mm-labels`), fit/eval harness with holdout lock
+  (`kalshi-mm-fit`), and the A/B promotion instrument (`kalshi-mm-ab` with
+  baseline/microprice-skew/toxicity-gate variants). Toxic-fill label defined as
+  side-adjusted 5s markout ≤ −1¢ (one tick, filters bounce noise). From here the
+  binding constraint is window count: screening at ≥300 (~2026-07-17), promotion
+  at ≥1,000 (~2026-07-25).

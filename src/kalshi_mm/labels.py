@@ -20,6 +20,7 @@ from .features import (
     _load_window,
     _window_is_final,
     group_recordings_by_market,
+    read_parquet_rows,
     window_feature_rows,
     write_parquet,
 )
@@ -87,6 +88,7 @@ def generate_labels(
     maker_fee_multiplier: float = 1.0,
     min_edge_dollars: float = 0.01,
     overwrite: bool = False,
+    features_dir: Optional[str | Path] = None,
 ) -> list[Path]:
     out_dir = Path(out_dir)
     written: list[Path] = []
@@ -105,7 +107,15 @@ def generate_labels(
             latency_ms=latency_ms,
             maker_fee_multiplier=maker_fee_multiplier,
         )
-        rows = fill_label_rows(result, window_feature_rows(window), ticker=market.ticker)
+        # Reuse the compacted feature store when available; recompute otherwise.
+        feature_rows = None
+        if features_dir is not None:
+            feature_path = Path(features_dir) / f"{market.ticker}.parquet"
+            if feature_path.exists():
+                feature_rows = read_parquet_rows(feature_path)
+        if feature_rows is None:
+            feature_rows = window_feature_rows(window)
+        rows = fill_label_rows(result, feature_rows, ticker=market.ticker)
         if not rows:
             print(f"[labels] {market.ticker}: no labeled fills; skipped", flush=True)
             del window, result
@@ -128,6 +138,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     parser.add_argument("recordings", nargs="+")
     parser.add_argument("--out", default="data/labels")
+    parser.add_argument("--features-dir", default=None, help="reuse compacted feature parquet for joins")
     parser.add_argument("--latency-ms", type=int, default=150)
     parser.add_argument("--maker-fee-multiplier", type=float, default=1.0)
     parser.add_argument("--min-edge", type=float, default=0.01)
@@ -140,6 +151,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         maker_fee_multiplier=args.maker_fee_multiplier,
         min_edge_dollars=args.min_edge,
         overwrite=args.overwrite,
+        features_dir=args.features_dir,
     )
     print(f"[labels] wrote {len(written)} window file(s) to {args.out}")
 

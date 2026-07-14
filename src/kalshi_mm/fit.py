@@ -32,20 +32,13 @@ V_TARGET = "fwd_mid_delta_5s"
 T_TARGET = "toxic_5s"
 
 
-def _read_parquet_rows(path: str | Path) -> list[dict[str, Any]]:
-    import pyarrow.parquet as pq
-
-    table = pq.read_table(path)
-    columns = {name: table.column(name).to_pylist() for name in table.column_names}
-    n = len(next(iter(columns.values()))) if columns else 0
-    return [{name: values[i] for name, values in columns.items()} for i in range(n)]
-
-
 def load_store(pattern: str) -> dict[str, list[dict[str, Any]]]:
     """window ticker -> rows, chronologically keyed by ticker sort order."""
+    from .features import read_parquet_rows
+
     store: dict[str, list[dict[str, Any]]] = {}
     for path in sorted(glob.glob(pattern)):
-        rows = _read_parquet_rows(path)
+        rows = read_parquet_rows(path)
         if rows:
             store[str(rows[0]["ticker"])] = rows
     return store

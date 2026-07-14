@@ -1,0 +1,23 @@
+[Unit]
+Description=Generate Model T fill labels for newly finalized Kalshi windows
+Wants=network-online.target
+After=kalshi-features.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kalshi_btc_mm
+EnvironmentFile=/home/ubuntu/.config/kalshi/collector.env
+ExecStart=/bin/bash -c 'shopt -s nullglob; exec /home/ubuntu/kalshi_btc_mm/.venv/bin/kalshi-mm-labels /home/ubuntu/kalshi_btc_mm/data/kalshi/*/events_*.jsonl.gz --out /home/ubuntu/kalshi_btc_mm/data/labels --features-dir /home/ubuntu/kalshi_btc_mm/data/features'
+TimeoutStartSec=30min
+UMask=0077
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryMax=1536M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/kalshi_btc_mm/data
+InaccessiblePaths=-/home/ubuntu/.config/kalshi/private-key.pem

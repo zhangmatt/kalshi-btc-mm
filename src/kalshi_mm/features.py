@@ -242,6 +242,17 @@ def _median(values: list[float]) -> float:
     return ordered[len(ordered) // 2]
 
 
+def read_parquet_rows(path: str | Path) -> list[dict[str, Any]]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - packaging failure
+        raise RuntimeError("pip install '.[research]' to enable parquet input") from exc
+    table = pq.read_table(path)
+    columns = {name: table.column(name).to_pylist() for name in table.column_names}
+    count = len(next(iter(columns.values()))) if columns else 0
+    return [{name: values[i] for name, values in columns.items()} for i in range(count)]
+
+
 def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     try:
         import pyarrow as pa

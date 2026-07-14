@@ -82,6 +82,32 @@ Research groups recording fragments by market ticker (one market = one window),
 warms volatility across consecutive windows, and prints per-window quality flags
 (fragments, BRTI gaps, reconnects). `--strict` excludes flagged windows.
 
+## Research Pipeline (STRATEGY.md §5–§6, §9)
+
+The feature store is append-only: each finalized window compacts once into parquet
+(a systemd timer, `kalshi-features.timer`, does this every five minutes on the
+collector host). Models refit on schedules as the store grows.
+
+```bash
+# 1. Feature store (automatic on the collector; manual anywhere):
+kalshi-mm-features data/kalshi/*/events_*.jsonl.gz --out data/features
+
+# 2. Model T labels: baseline replay fills -> side-adjusted markouts -> toxic flag
+kalshi-mm-labels data/kalshi/*/events_*.jsonl.gz --out data/labels
+
+# 3. Fit + evaluate (P1 calibration, Model V val IC, Model T val AUC).
+#    The final 20% of windows is holdout and excluded unless --unlock-holdout.
+kalshi-mm-fit --features "data/features/*.parquet" --labels "data/labels/*.fills.parquet"
+
+# 4. A/B quoting variants at identical fees/latency, bootstrap CI vs baseline:
+kalshi-mm-ab data/kalshi/*/events_*.jsonl.gz --variants baseline,micro25,micro50
+kalshi-mm-ab ... --variants baseline,toxgate --model-t data/models/model_t.json
+```
+
+Promotion rules (binding): ≥300 windows to screen, ≥1,000 to promote, bootstrap CI
+excluding zero on net markout AND settlement P&L, holdout touched once. Every run
+that informs a decision gets an entry in `docs/experiments/`.
+
 Continuous collection rolls to the next market at close and finalizes outcomes asynchronously:
 
 ```bash
