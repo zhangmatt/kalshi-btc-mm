@@ -236,6 +236,14 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
   all prior zero-fee results invalidated.
 - **2026-07-14** — 150ms latency became the replay default; zero-latency results
   invalidated for promotion purposes.
+- **2026-07-14 (feeds)** — Feature-store inspection (28 windows) found the Binance.US
+  reference feeds were the BTC**USDT** pair, injecting ~10bp of stablecoin basis into
+  the external composite and basis features (ext_basis p75 = +10.9bp). Switched to the
+  USD-quoted BTCUSD streams at the 13:15 UTC rollover. Basis features from windows
+  before 2026-07-14T13:15Z are contaminated whenever Binance was the fresh venue;
+  prefer post-switch windows for basis-feature research. Also noted: `jump_ratio` is
+  saturated (median 0.83) under its 5×-median cutoff on BRTI's 1s staircase — treat
+  as non-informative until redesigned.
 - **2026-07-14 (later)** — P2 tooling complete ahead of data: feature store
   (`kalshi-mm-features` + 5-min compaction timer on the collector host), Model T
   label pipeline (`kalshi-mm-labels`), fit/eval harness with holdout lock

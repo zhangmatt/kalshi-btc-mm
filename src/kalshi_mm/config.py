@@ -49,8 +49,11 @@ class KalshiRuntimeConfig:
             "KALSHI_BINANCE_WS_URL",
             "wss://stream.binance.com:9443/ws/btcusdt@trade",
         )
+        # BRTI and the other reference venues are USD-quoted. Binance.US lists a
+        # real BTCUSD pair; Binance.com only lists BTCUSDT, whose ~10bp stablecoin
+        # basis contaminates cross-venue features — prefer the USD pair on .us.
         default_binance_depth_url = (
-            "wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms"
+            "wss://stream.binance.us:9443/ws/btcusd@depth20@100ms"
             if "stream.binance.us" in binance_ws_url
             else "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
         )
