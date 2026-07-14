@@ -131,6 +131,10 @@ class KalshiMakerStrategy:
             if bbo.bid < ask < 1.0 and edge >= self.config.min_edge_dollars - 1e-9:
                 desired.append(KalshiQuote("ask", ask, min(ask_count, self.config.max_open_count), edge))
 
+        # Sub-minimum quotes (e.g. inventory-room dust near the position cap) are
+        # never worth posting and would churn against the keep floor forever.
+        desired = [quote for quote in desired if quote.count >= self.config.min_order_count]
+
         if inventory.cash_dollars is not None and desired:
             available = max(0.0, inventory.cash_dollars - self.config.cash_reserve_dollars)
             required = sum(
@@ -164,7 +168,12 @@ class KalshiMakerStrategy:
                 continue
             # Cancel/repost forfeits queue priority, so tolerate a partially
             # filled or slightly oversized resting order at the right price.
-            keep_floor = max(self.config.min_order_count, self.config.requote_remaining_fraction * target.count)
+            # The floor is clamped by the target so a freshly posted order can
+            # always satisfy it (otherwise a sub-floor target churns forever).
+            keep_floor = min(
+                target.count,
+                max(self.config.min_order_count, self.config.requote_remaining_fraction * target.count),
+            )
             if order.remaining_count + 1e-9 < keep_floor:
                 cancel.append(order.order_id)
         for side, target in desired_by_side.items():
