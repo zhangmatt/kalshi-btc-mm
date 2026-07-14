@@ -222,7 +222,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--unlock-holdout",
         action="store_true",
-        help="include the final 20% holdout windows (ONE final promotion read only)",
+        help="include the final 20%% holdout windows (ONE final promotion read only)",
     )
     args = parser.parse_args(argv)
     store = load_store(args.features)
