@@ -6,6 +6,8 @@ charset-normalizer==3.4.9
 cryptography==49.0.0
 idna==3.18
 jmespath==1.1.0
+numpy==2.5.1
+pyarrow==25.0.0
 pycparser==3.0
 python-dateutil==2.9.0.post0
 requests==2.34.2
