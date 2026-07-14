@@ -18,6 +18,7 @@ import numpy as np
 
 from .models import (
     FEATURE_SETS,
+    T_MIRRORED_FEATURES,
     TIME_BUCKETS,
     LinearModel,
     block_bootstrap_ci,
@@ -25,11 +26,14 @@ from .models import (
     chronological_split,
     fit_logistic,
     fit_ridge,
+    mirror_features,
     save_models,
 )
 
 V_TARGET = "fwd_mid_delta_5s"
 T_TARGET = "toxic_5s"
+# A market state is adverse for a side when the mid moves >= 1c against it in 5s.
+STATE_TAIL_DOLLARS = 0.01
 
 
 def load_store(pattern: str) -> dict[str, list[dict[str, Any]]]:
@@ -153,48 +157,116 @@ def run_v(
     return lines
 
 
+def _mirrored_fill_row(row: dict[str, Any]) -> Optional[dict[str, Optional[float]]]:
+    side = row.get("fill_side")
+    if side not in {"bid", "ask"}:
+        return None
+    return mirror_features(row, str(side))
+
+
+def _state_training_rows(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Optional[float]], float, float]]:
+    """(mirrored features, seconds_to_close, adverse label) for BOTH hypothetical sides.
+
+    Every feature row becomes two counterfactual samples: would a resting bid
+    (mid drops >= 1c) or a resting ask (mid rises >= 1c) have been swept in the
+    next 5s? ~20x the training data of fill-only labels, with no fill bias.
+    """
+    out = []
+    for row in rows:
+        move = row.get(V_TARGET)
+        stc = row.get("seconds_to_close")
+        if move is None or stc is None:
+            continue
+        move = float(move)
+        out.append((mirror_features(row, "bid"), float(stc), float(move <= -STATE_TAIL_DOLLARS)))
+        out.append((mirror_features(row, "ask"), float(stc), float(move >= STATE_TAIL_DOLLARS)))
+    return out
+
+
+def _fill_auc_brier(
+    model: LinearModel, val_rows: list[dict[str, Any]], bucket: tuple[float, float]
+) -> tuple[Optional[float], float, int]:
+    pairs = []
+    for row in val_rows:
+        if bucket_of(float(row["seconds_to_close"])) != bucket:
+            continue
+        mirrored = _mirrored_fill_row(row)
+        target = row.get(T_TARGET)
+        if mirrored is None or target is None:
+            continue
+        p = model.predict([mirrored.get(name) for name in model.features])
+        if p is not None:
+            pairs.append((p, float(target)))
+    auc = _auc(pairs)
+    brier = float(np.mean([(p - y_) ** 2 for p, y_ in pairs])) if pairs else float("nan")
+    return auc, brier, len(pairs)
+
+
 def run_t(
+    store: dict[str, list[dict[str, Any]]],
     fills_store: dict[str, list[dict[str, Any]]],
     train_ids: list[str],
     val_ids: list[str],
     out_dir: Path,
 ) -> list[str]:
-    lines = ["", f"== Model T (logistic -> {T_TARGET}) train={len(train_ids)}w val={len(val_ids)}w =="]
-    train_rows = [row for ticker in train_ids if ticker in fills_store for row in fills_store[ticker]]
-    val_rows = [row for ticker in val_ids if ticker in fills_store for row in fills_store[ticker]]
-    lines.append(f"train_fills={len(train_rows)} val_fills={len(val_rows)}")
-    if not train_rows:
-        lines.append("no training fills yet; skipped")
-        return lines
-    promoted: list[LinearModel] = []
-    lines.append(f"{'set':>9s} {'bucket_s':>10s} {'n_train':>8s} {'base_rate':>9s} {'val_n':>6s} {'val_auc':>8s} {'val_brier':>9s}")
-    for set_name, features in FEATURE_SETS.items():
-        for bucket, rows in sorted(_bucket_rows(train_rows).items()):
-            x, y = _matrix(rows, features, T_TARGET)
-            if len(y) < 100 or len(set(y.tolist())) < 2:
-                continue
-            model = fit_logistic(x, y, features=features, bucket=bucket)
-            model.meta["feature_set"] = set_name
-            # validation AUC + Brier
-            pairs = []
-            for row in val_rows:
-                if bucket_of(float(row["seconds_to_close"])) != bucket:
+    """Model T, two trainings, one evaluation.
+
+    Both variants use side-mirrored features (so directional signals cannot
+    cancel across mixed bid/ask samples) and are always evaluated on the same
+    thing: actual simulated-fill toxicity on validation windows.
+    - fills: logistic on fill outcomes (matches deployment exactly, few samples)
+    - state: logistic on counterfactual adverse-move labels from ALL feature
+      rows (20x samples; assumes state toxicity ~ fill toxicity)
+    """
+    lines = ["", f"== Model T (side-mirrored logistic) train={len(train_ids)}w val={len(val_ids)}w =="]
+    train_fills = [row for ticker in train_ids if ticker in fills_store for row in fills_store[ticker]]
+    val_fills = [row for ticker in val_ids if ticker in fills_store for row in fills_store[ticker]]
+    lines.append(f"train_fills={len(train_fills)} val_fills={len(val_fills)}")
+    features = T_MIRRORED_FEATURES
+    candidates: dict[str, list[LinearModel]] = {"fills": [], "state": []}
+    lines.append(f"{'training':>9s} {'bucket_s':>10s} {'n_train':>8s} {'base_rate':>9s} {'val_n':>6s} {'val_auc':>8s} {'val_brier':>9s}")
+
+    # -- fills training --
+    fill_samples: dict[tuple[float, float], list[tuple[dict, float]]] = defaultdict(list)
+    for row in train_fills:
+        mirrored = _mirrored_fill_row(row)
+        bucket = bucket_of(float(row["seconds_to_close"]))
+        target = row.get(T_TARGET)
+        if mirrored is not None and bucket is not None and target is not None:
+            fill_samples[bucket].append((mirrored, float(target)))
+    # -- state training --
+    train_states = _state_training_rows([row for ticker in train_ids if ticker in store for row in store[ticker]])
+    state_samples: dict[tuple[float, float], list[tuple[dict, float]]] = defaultdict(list)
+    for mirrored, stc, label in train_states:
+        bucket = bucket_of(stc)
+        if bucket is not None:
+            state_samples[bucket].append((mirrored, label))
+
+    for training, samples in (("fills", fill_samples), ("state", state_samples)):
+        for bucket in TIME_BUCKETS:
+            rows = samples.get(bucket, [])
+            xs, ys = [], []
+            for mirrored, label in rows:
+                values = [mirrored.get(name) for name in features]
+                if any(value is None for value in values):
                     continue
-                p = model.predict([row.get(name) for name in features])
-                target = row.get(T_TARGET)
-                if p is not None and target is not None:
-                    pairs.append((p, float(target)))
-            auc = _auc(pairs)
-            brier = float(np.mean([(p - y_) ** 2 for p, y_ in pairs])) if pairs else float("nan")
+                xs.append([float(v) for v in values])
+                ys.append(label)
+            if len(ys) < 200 or len(set(ys)) < 2:
+                continue
+            model = fit_logistic(np.array(xs), np.array(ys), features=features, bucket=bucket)
+            model.meta["training"] = training
+            auc, brier, val_n = _fill_auc_brier(model, val_fills, bucket)
             lines.append(
-                f"{set_name:>9s} {f'{int(bucket[0])}-{int(bucket[1])}':>10s} {len(y):8d} "
-                f"{float(y.mean()):9.3f} {len(pairs):6d} "
+                f"{training:>9s} {f'{int(bucket[0])}-{int(bucket[1])}':>10s} {len(ys):8d} "
+                f"{float(np.mean(ys)):9.3f} {val_n:6d} "
                 f"{auc if auc is not None else float('nan'):8.3f} {brier:9.4f}"
             )
-            promoted.append(model)
-    if promoted:
-        save_models(promoted, out_dir / "model_t.json")
-        lines.append(f"saved {len(promoted)} bucket models -> {out_dir / 'model_t.json'}")
+            candidates[training].append(model)
+    for training, models in candidates.items():
+        if models:
+            save_models(models, out_dir / f"model_t_{training}.json")
+            lines.append(f"saved {len(models)} bucket models -> {out_dir / f'model_t_{training}.json'}")
     return lines
 
 
@@ -242,7 +314,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(line)
     for line in run_v(store, train_ids, val_ids, out_dir):
         print(line)
-    for line in run_t(fills_store, train_ids, val_ids, out_dir):
+    for line in run_t(store, fills_store, train_ids, val_ids, out_dir):
         print(line)
 
 

@@ -84,6 +84,42 @@ def test_block_bootstrap_ci_covers_mean():
     assert high - low < 1.5
 
 
+def test_mirror_features_aligns_adverse_pressure():
+    from kalshi_mm.models import mirror_features
+
+    row = {
+        "imb_top1": -0.6,  # book leaning down
+        "imb_top3": -0.3,
+        "microprice_minus_mid": -0.002,
+        "flow_1s": -50.0,
+        "flow_5s": -200.0,
+        "bid_size_delta": -40.0,  # bid depth evaporating
+        "ask_size_delta": 25.0,   # ask depth building
+        "ext_micro_lead_bps": -1.5,
+        "ext_imbalance": -0.4,
+        "gbm_fair_minus_mid": -0.01,
+        "spread": 0.01,
+        "trades_5s": 80,
+    }
+    bid = mirror_features(row, "bid")
+    ask = mirror_features(row, "ask")
+    # Downward pressure is adverse (positive) for resting bids, benign for asks.
+    assert bid["adv_imb_top1"] == 0.6 and ask["adv_imb_top1"] == -0.6
+    assert bid["adv_flow_5s"] == 200.0 and ask["adv_flow_5s"] == -200.0
+    # Own bid depth evaporating and ask depth building are both adverse for bids.
+    assert bid["adv_own_depth_delta"] == 40.0
+    assert bid["adv_opp_depth_delta"] == 25.0
+    # For asks, "own" depth is the ask side (which grew -> benign/negative).
+    assert ask["adv_own_depth_delta"] == -25.0
+    assert ask["adv_opp_depth_delta"] == -40.0
+    # Symmetric features pass through unchanged.
+    assert bid["spread"] == ask["spread"] == 0.01
+    # None propagates rather than fabricating a value.
+    assert mirror_features({"spread": 0.01}, "bid")["adv_imb_top1"] is None
+    with pytest.raises(ValueError):
+        mirror_features(row, "yes")
+
+
 def test_bucket_of_boundaries():
     assert bucket_of(90.0) == (90.0, 300.0)
     assert bucket_of(299.9) == (90.0, 300.0)

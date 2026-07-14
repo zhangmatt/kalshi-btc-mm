@@ -43,25 +43,27 @@ def test_microprice_skew_leans_toward_heavy_side():
 
 
 def test_toxicity_gate_penalizes_leaned_against_side(tmp_path):
-    # A model that predicts toxic whenever imbalance is negative.
+    # A model that predicts toxic when adverse-side pressure is positive.
+    from kalshi_mm.models import T_MIRRORED_FEATURES, load_models
+
     rng = np.random.default_rng(0)
-    x = rng.normal(size=(600, 10))
-    features = (
-        "imb_top1", "imb_top3", "microprice_minus_mid", "flow_1s", "flow_5s",
-        "bid_size_delta", "ask_size_delta", "spread", "gbm_fair_minus_mid", "jump_ratio",
-    )
-    y = (x[:, 0] < 0).astype(float)
-    model = fit_logistic(x, y, features=features, bucket=(300.0, 600.0), l2=1e-3)
+    x = rng.normal(size=(800, len(T_MIRRORED_FEATURES)))
+    y = (x[:, 0] > 0).astype(float)  # adv_imb_top1 > 0 -> toxic
+    model = fit_logistic(x, y, features=T_MIRRORED_FEATURES, bucket=(300.0, 600.0), l2=1e-3)
     path = tmp_path / "model_t.json"
     save_models([model], path)
-    gate = ToxicityGate(
-        __import__("kalshi_mm.models", fromlist=["load_models"]).load_models(path)
-    )
-    ctx = _context(bid_size=10.0, ask_size=30.0)  # negative imbalance -> bids toxic
+    gate = ToxicityGate(load_models(path))
+    # Ask-heavy book: imbalance negative -> adverse for resting BIDS only.
+    ctx = _context(bid_size=10.0, ask_size=30.0)
     fair, bid_tox, ask_tox = gate.adjust(ctx)
     assert fair == ctx.fair_yes
     assert bid_tox > 0.0
-    assert ask_tox == 0.0
+    assert bid_tox > ask_tox
+    # Outside every model bucket: no tax.
+    from dataclasses import replace
+
+    far = replace(ctx, seconds_to_close=800.0)
+    assert gate.adjust(far) == (ctx.fair_yes, 0.0, 0.0)
 
 
 def test_build_variants_parses_spec(tmp_path):

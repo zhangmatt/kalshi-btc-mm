@@ -43,6 +43,60 @@ FEATURE_SETS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Toxicity features are side-mirrored: each value means "pressure AGAINST the
+# resting side," so one model serves both sides and directional signals do not
+# cancel across mixed bid/ask training samples.
+T_MIRRORED_FEATURES = (
+    "adv_imb_top1",
+    "adv_imb_top3",
+    "adv_microprice",
+    "adv_flow_1s",
+    "adv_flow_5s",
+    "adv_own_depth_delta",
+    "adv_opp_depth_delta",
+    "adv_ext_micro_lead",
+    "adv_ext_imbalance",
+    "adv_fair_minus_mid",
+    "spread",
+    "trades_5s",
+)
+
+
+def mirror_features(row: dict, side: str) -> dict[str, Optional[float]]:
+    """Recast raw features so positive always means adverse to `side`.
+
+    A resting bid is hurt by downward pressure (negative imbalance/flow), a
+    resting ask by upward pressure — the sign flip aligns them.
+    """
+    if side not in {"bid", "ask"}:
+        raise ValueError("side must be bid or ask")
+    sign = -1.0 if side == "bid" else 1.0
+
+    def signed(name: str) -> Optional[float]:
+        value = row.get(name)
+        return sign * float(value) if value is not None else None
+
+    own = "bid_size_delta" if side == "bid" else "ask_size_delta"
+    opp = "ask_size_delta" if side == "bid" else "bid_size_delta"
+    own_value = row.get(own)
+    opp_value = row.get(opp)
+    return {
+        "adv_imb_top1": signed("imb_top1"),
+        "adv_imb_top3": signed("imb_top3"),
+        "adv_microprice": signed("microprice_minus_mid"),
+        "adv_flow_1s": signed("flow_1s"),
+        "adv_flow_5s": signed("flow_5s"),
+        # Own-side depth evaporating and opposite-side depth building are both adverse.
+        "adv_own_depth_delta": -float(own_value) if own_value is not None else None,
+        "adv_opp_depth_delta": float(opp_value) if opp_value is not None else None,
+        "adv_ext_micro_lead": signed("ext_micro_lead_bps"),
+        "adv_ext_imbalance": signed("ext_imbalance"),
+        "adv_fair_minus_mid": signed("gbm_fair_minus_mid"),
+        "spread": row.get("spread"),
+        "trades_5s": row.get("trades_5s"),
+    }
+
+
 def bucket_of(seconds_to_close: float) -> Optional[tuple[float, float]]:
     for low, high in TIME_BUCKETS:
         if low <= seconds_to_close < high:

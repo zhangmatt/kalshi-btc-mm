@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .features import _load_window, _window_is_final, group_recordings_by_market
-from .models import LinearModel, block_bootstrap_ci, load_models
+from .models import LinearModel, block_bootstrap_ci, load_models, mirror_features
 from .replay import QuoteAdjuster, QuoteContext, ReplayResult, replay_rows
 
 
@@ -36,20 +36,21 @@ class MicropriceSkew(QuoteAdjuster):
 
 
 class ToxicityGate(QuoteAdjuster):
-    """Model T consumer: convert P(toxic) into per-side extra edge requirements."""
+    """Model T consumer: per-side P(toxic) from side-mirrored features."""
 
-    def __init__(self, models: list[LinearModel], *, scale_dollars: float = 0.02):
+    def __init__(self, models: list[LinearModel], *, scale_dollars: float = 0.02, base: float = 0.5):
         self.models = models
         self.scale_dollars = scale_dollars
+        self.base = base
         self.name = "toxgate"
 
-    def _probability(self, ctx: QuoteContext, feature_values: dict[str, Optional[float]]) -> Optional[float]:
+    def _model_for(self, seconds_to_close: float) -> Optional[LinearModel]:
         for model in self.models:
-            if model.bucket[0] <= ctx.seconds_to_close < model.bucket[1]:
-                return model.predict([feature_values.get(name) for name in model.features])
+            if model.bucket[0] <= seconds_to_close < model.bucket[1]:
+                return model
         return None
 
-    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+    def _raw_features(self, ctx: QuoteContext) -> dict[str, Optional[float]]:
         bbo = ctx.bbo
         total = bbo.bid_size + bbo.ask_size
         mid = (bbo.bid + bbo.ask) / 2.0 if bbo.bid is not None and bbo.ask is not None else None
@@ -61,29 +62,38 @@ class ToxicityGate(QuoteAdjuster):
         depth_bid3 = sum(size for _, size in bids3)
         depth_ask3 = sum(size for _, size in asks3)
         depth3 = depth_bid3 + depth_ask3
-        values: dict[str, Optional[float]] = {
+        return {
             "imb_top1": (bbo.bid_size - bbo.ask_size) / total if total > 0 else 0.0,
             "imb_top3": (depth_bid3 - depth_ask3) / depth3 if depth3 > 0 else 0.0,
             "microprice_minus_mid": (microprice - mid) if microprice is not None and mid is not None else 0.0,
             "flow_1s": ctx.flow_1s,
             "flow_5s": ctx.flow_5s,
+            # Depth deltas and external features are not tracked in replay context
+            # yet; mirrored values fall back to 0 (neutral) via `or 0.0` below.
             "bid_size_delta": 0.0,
             "ask_size_delta": 0.0,
+            "ext_micro_lead_bps": 0.0,
+            "ext_imbalance": 0.0,
             "spread": (bbo.ask - bbo.bid) if bbo.bid is not None and bbo.ask is not None else None,
-            "gbm_fair_minus_mid": (ctx.fair_yes - mid) if mid is not None else None,
-            "jump_ratio": 0.0,
+            "gbm_fair_minus_mid": (ctx.fair_yes - mid) if mid is not None else 0.0,
+            "trades_5s": 0.0,
         }
-        probability = self._probability(ctx, values)
-        if probability is None:
+
+    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+        model = self._model_for(ctx.seconds_to_close)
+        if model is None:
             return ctx.fair_yes, 0.0, 0.0
-        base = 0.5
-        excess = max(0.0, probability - base) / (1.0 - base)
-        tox = excess * self.scale_dollars
-        # Direction: book leaning down (imbalance < 0) makes resting bids toxic.
-        lean = values["imb_top1"] or 0.0
-        bid_tox = tox if lean < 0 else 0.0
-        ask_tox = tox if lean > 0 else 0.0
-        return ctx.fair_yes, bid_tox, ask_tox
+        raw = self._raw_features(ctx)
+        taxes = {}
+        for side in ("bid", "ask"):
+            mirrored = mirror_features(raw, side)
+            probability = model.predict([mirrored.get(name) for name in model.features])
+            if probability is None:
+                taxes[side] = 0.0
+                continue
+            excess = max(0.0, probability - self.base) / max(1e-9, 1.0 - self.base)
+            taxes[side] = excess * self.scale_dollars
+        return ctx.fair_yes, taxes["bid"], taxes["ask"]
 
 
 def build_variants(spec: str, model_t_path: Optional[str]) -> list[QuoteAdjuster]:
@@ -198,7 +208,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="A/B quoting variants over recorded windows.")
     parser.add_argument("recordings", nargs="+")
     parser.add_argument("--variants", default="baseline,micro25,micro50")
-    parser.add_argument("--model-t", default="data/models/model_t.json")
+    parser.add_argument("--model-t", default="data/models/model_t_state.json")
     parser.add_argument("--latency-ms", type=int, default=150)
     parser.add_argument("--maker-fee-multiplier", type=float, default=0.0)
     args = parser.parse_args(argv)
