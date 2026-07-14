@@ -167,7 +167,7 @@ def replay(
     *,
     min_edge_dollars: float = 0.01,
     latency_ms: int = 150,
-    maker_fee_multiplier: float = 1.0,
+    maker_fee_multiplier: float = 0.0,
     prewarm_paths: tuple[str | Path, ...] = (),
     adjuster: Optional[QuoteAdjuster] = None,
 ) -> ReplayResult:
@@ -197,7 +197,7 @@ def replay_rows(
     *,
     min_edge_dollars: float = 0.01,
     latency_ms: int = 150,
-    maker_fee_multiplier: float = 1.0,
+    maker_fee_multiplier: float = 0.0,
     prewarm_ticks: list[tuple[int, float]] = [],
     adjuster: Optional[QuoteAdjuster] = None,
 ) -> ReplayResult:
@@ -375,8 +375,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--maker-fee-multiplier",
         type=float,
-        default=1.0,
-        help="0 disables maker fees; 1 applies the standard 0.0175 quadratic rate (unverified for CRYPTO15M)",
+        default=0.0,
+        help="KXBTC15M charges no maker fee (verified 2026-07-07 schedule); set 1 for series that do",
     )
     parser.add_argument(
         "--prewarm",

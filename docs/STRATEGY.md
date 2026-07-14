@@ -197,10 +197,11 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
 
 ## 10. Open Verification Queue
 
-1. **Maker fee for CRYPTO15M — CRITICAL, blocks trust in every absolute number.** Current
-   assumption: standard 0.0175 quadratic maker rate (conservative). Resolve via fee-schedule
-   PDF (bot-blocked for us; human download works) or the fee field on the first real fill.
-   If actual = 0, every replay improves by ~0.4¢/contract at mid prices.
+1. **~~Maker fee for CRYPTO15M~~ — RESOLVED 2026-07-14.** The 2026-07-07 fee schedule
+   (archived: `docs/kalshi-fee-schedule-20260707.pdf`) shows KXBTC15M absent from the
+   Non-Standard Fees table; the maker multiplier defaults to **0 → no maker fee**.
+   Taker: standard 0.07 quadratic rate, centicent round-up. Residual check: confirm
+   the fee field on the first real fill; watch `series_fee_changes` for changes.
 2. **Incumbent footprint study.** He is likely in our recordings. Measure: persistent
    two-sided depth at consistent offsets, requote cadence, quote lifetimes, pull-latency
    after external moves. Output: what we must beat. (Research task, data already on disk.)
@@ -236,6 +237,13 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
   all prior zero-fee results invalidated.
 - **2026-07-14** — 150ms latency became the replay default; zero-latency results
   invalidated for promotion purposes.
+- **2026-07-14 (fees)** — Maker fee VERIFIED = 0 for KXBTC15M from the official
+  2026-07-07 schedule (§10.1 resolved). All defaults flipped from the conservative
+  multiplier 1 to the true 0; taker fee corrected to centicent round-up per the
+  schedule formula. Every fee-on result from earlier today overstated costs by
+  ~0.44¢/contract at mid prices; labels/fits regenerated under true fees. Baseline
+  per-fill economics revise from ≈−0.9¢ to ≈−0.45¢ — adverse selection remains the
+  dominant cost, with zero fee drag on maker improvements.
 - **2026-07-14 (feeds)** — Feature-store inspection (28 windows) found the Binance.US
   reference feeds were the BTC**USDT** pair, injecting ~10bp of stablecoin basis into
   the external composite and basis features (ext_basis p75 = +10.9bp). Switched to the

@@ -65,7 +65,7 @@ class KalshiRuntimeConfig:
             inventory_skew_dollars=float(env.get("KALSHI_INVENTORY_SKEW_DOLLARS", "0.02")),
             stale_after_ms=int(env.get("KALSHI_STALE_AFTER_MS", "2000")),
             stop_quote_before_close_s=float(env.get("KALSHI_CLOSE_CUTOFF_S", "90")),
-            maker_fee_multiplier=float(env.get("KALSHI_MAKER_FEE_MULTIPLIER", "1")),
+            maker_fee_multiplier=float(env.get("KALSHI_MAKER_FEE_MULTIPLIER", "0")),
             max_quote_notional_dollars=float(env.get("KALSHI_MAX_QUOTE_NOTIONAL_DOLLARS", "10")),
             cash_reserve_dollars=float(env.get("KALSHI_CASH_RESERVE_DOLLARS", "10")),
             min_order_count=float(env.get("KALSHI_MIN_ORDER_COUNT", "1")),

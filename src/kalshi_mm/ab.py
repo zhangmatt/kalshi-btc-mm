@@ -200,7 +200,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--variants", default="baseline,micro25,micro50")
     parser.add_argument("--model-t", default="data/models/model_t.json")
     parser.add_argument("--latency-ms", type=int, default=150)
-    parser.add_argument("--maker-fee-multiplier", type=float, default=1.0)
+    parser.add_argument("--maker-fee-multiplier", type=float, default=0.0)
     args = parser.parse_args(argv)
     variants = build_variants(args.variants, args.model_t)
     outcomes = run_ab(

@@ -50,9 +50,10 @@ class KalshiStrategyConfig:
     inventory_skew_dollars: float = 0.02
     stale_after_ms: int = 2_000
     stop_quote_before_close_s: float = 90.0
-    # Conservative default: assume the standard 0.0175 maker rate applies to this
-    # series until verified against the fee schedule or a real fill.
-    maker_fee_multiplier: float = 1.0
+    # KXBTC15M has no maker fee: it is absent from the fee schedule's Non-Standard
+    # table and the schedule's maker multiplier defaults to 0 (verified 2026-07-14,
+    # docs/kalshi-fee-schedule-20260707.pdf). Set to 1 for series that charge it.
+    maker_fee_multiplier: float = 0.0
     max_quote_notional_dollars: float = 10.0
     cash_reserve_dollars: float = 10.0
     min_order_count: float = 1.0

@@ -85,7 +85,7 @@ def generate_labels(
     out_dir: str | Path,
     *,
     latency_ms: int = 150,
-    maker_fee_multiplier: float = 1.0,
+    maker_fee_multiplier: float = 0.0,
     min_edge_dollars: float = 0.01,
     overwrite: bool = False,
     features_dir: Optional[str | Path] = None,
@@ -140,7 +140,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--out", default="data/labels")
     parser.add_argument("--features-dir", default=None, help="reuse compacted feature parquet for joins")
     parser.add_argument("--latency-ms", type=int, default=150)
-    parser.add_argument("--maker-fee-multiplier", type=float, default=1.0)
+    parser.add_argument("--maker-fee-multiplier", type=float, default=0.0)
     parser.add_argument("--min-edge", type=float, default=0.01)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)

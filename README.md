@@ -58,12 +58,14 @@ with `KALSHI_EXTERNAL_DEPTH_ENABLED`, `KALSHI_EXTERNAL_DEPTH_LEVELS`, and
 
 ## Fees
 
-All maker-edge math and simulated fills assume the standard 0.0175 quadratic maker
-rate (`KALSHI_MAKER_FEE_MULTIPLIER=1`, ceil-to-cent on charged fees). **This has not
-been verified against the published fee schedule for CRYPTO15M** — confirm it from
-the fee schedule PDF or a real fill before trusting absolute P&L numbers, and set
-the multiplier to 0 only if the series is confirmed maker-fee-free. Taker fees use
-the standard 0.07 rate.
+**Verified against the 2026-07-07 fee schedule** (archived at
+`docs/kalshi-fee-schedule-20260707.pdf`): KXBTC15M charges **no maker fee** — the
+series is absent from the schedule's Non-Standard Fees table and the maker formula's
+multiplier defaults to 0. Taker fees use the standard 0.07 quadratic rate
+(≈1.75¢/contract at $0.50), rounded up to a centicent per the schedule formula.
+Defaults reflect this (`KALSHI_MAKER_FEE_MULTIPLIER=0`); set the multiplier to 1
+for series listed with maker fees. Re-verify on the first real fill and after any
+scheduled fee change (the collector records `series_fee_changes` each window).
 
 ## Collect And Analyze
 
