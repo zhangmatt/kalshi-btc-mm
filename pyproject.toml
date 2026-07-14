@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+research = ["pyarrow>=15.0", "duckdb>=1.0"]
 
 [project.scripts]
 kalshi-mm-collect = "kalshi_mm.collect:main"
@@ -25,6 +26,7 @@ kalshi-mm-audit = "kalshi_mm.audit:main"
 kalshi-mm-archive = "kalshi_mm.archive:main"
 kalshi-mm-replay = "kalshi_mm.replay:main"
 kalshi-mm-research = "kalshi_mm.research:main"
+kalshi-mm-features = "kalshi_mm.features:main"
 kalshi-mm-run = "kalshi_mm.runner:main"
 
 [tool.setuptools.packages.find]

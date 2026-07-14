@@ -456,6 +456,15 @@ class KalshiOrderBook:
             levels = self._bids if side == "bid" else self._asks
             return levels.get(self._key(price), 0.0)
 
+    def top_levels(self, side: str, count: int) -> list[tuple[float, float]]:
+        """Best `count` (price, size) levels, best first."""
+        if side not in {"bid", "ask"}:
+            raise ValueError("side must be bid or ask")
+        with self._lock:
+            levels = self._bids if side == "bid" else self._asks
+            keys = sorted(levels, reverse=side == "bid")[:count]
+            return [(key / 10_000, levels[key]) for key in keys]
+
 
 @dataclass
 class BrtiState:
