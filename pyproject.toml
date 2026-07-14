@@ -27,6 +27,9 @@ kalshi-mm-archive = "kalshi_mm.archive:main"
 kalshi-mm-replay = "kalshi_mm.replay:main"
 kalshi-mm-research = "kalshi_mm.research:main"
 kalshi-mm-features = "kalshi_mm.features:main"
+kalshi-mm-labels = "kalshi_mm.labels:main"
+kalshi-mm-fit = "kalshi_mm.fit:main"
+kalshi-mm-ab = "kalshi_mm.ab:main"
 kalshi-mm-run = "kalshi_mm.runner:main"
 
 [tool.setuptools.packages.find]

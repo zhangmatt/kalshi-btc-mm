@@ -1,0 +1,12 @@
+[Unit]
+Description=Compact new Kalshi windows into features every five minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

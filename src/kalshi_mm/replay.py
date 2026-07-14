@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -105,6 +106,7 @@ class ReplayResult:
     settlement_source: Optional[str]
     settlement_reference: Optional[float]
     fair_mid_mae: Optional[float]
+    mids: tuple[tuple[int, float], ...] = ()
 
 
 def _markout(fills: list[ReplayFill], mids: list[tuple[int, float]], horizon_ms: int) -> Optional[float]:
@@ -121,6 +123,32 @@ def _markout(fills: list[ReplayFill], mids: list[tuple[int, float]], horizon_ms:
         total += (future_mid - fill.price if fill.side == "bid" else fill.price - future_mid) * fill.count
         contracts += fill.count
     return total / contracts if contracts > 0 else None
+
+
+@dataclass(frozen=True)
+class QuoteContext:
+    """State handed to a QuoteAdjuster before each strategy decision."""
+
+    ts_ms: int
+    seconds_to_close: float
+    fair_yes: float
+    bbo: Any
+    book: KalshiOrderBook
+    flow_5s: float
+    flow_1s: float
+
+
+class QuoteAdjuster:
+    """Pluggable quoting variant: adjust fair value and per-side toxicity.
+
+    The baseline (identity) adjuster reproduces plain settlement-model quoting.
+    Variants used by the A/B harness subclass or configure this.
+    """
+
+    name = "baseline"
+
+    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+        return ctx.fair_yes, 0.0, 0.0
 
 
 def extract_brti_ticks(rows: Iterable[Any]) -> list[tuple[int, float]]:
@@ -141,27 +169,53 @@ def replay(
     latency_ms: int = 150,
     maker_fee_multiplier: float = 1.0,
     prewarm_paths: tuple[str | Path, ...] = (),
+    adjuster: Optional[QuoteAdjuster] = None,
 ) -> ReplayResult:
-    """Queue-aware replay with a feed-to-matching-engine latency model.
-
-    Every plan the strategy produces activates latency_ms after the decision:
-    new orders join the queue against the book as of activation, and cancelled
-    orders remain fillable until the cancel activates.
-    """
-    if latency_ms < 0:
-        raise ValueError("latency_ms cannot be negative")
+    """Queue-aware replay of one recording file. See replay_rows for semantics."""
     rows = list(iter_events(path))
     metadata = next((row["payload"] for row in rows if row["event_type"] == "market_metadata"), None)
     if metadata is None:
         raise ValueError("recording has no market_metadata event")
     market = KalshiMarket.from_api(metadata)
+    prewarm: list[tuple[int, float]] = []
+    for prewarm_path in prewarm_paths:
+        prewarm.extend(extract_brti_ticks(iter_events(prewarm_path)))
+    return replay_rows(
+        market,
+        rows,
+        min_edge_dollars=min_edge_dollars,
+        latency_ms=latency_ms,
+        maker_fee_multiplier=maker_fee_multiplier,
+        prewarm_ticks=prewarm,
+        adjuster=adjuster,
+    )
+
+
+def replay_rows(
+    market: KalshiMarket,
+    rows: list[Any],
+    *,
+    min_edge_dollars: float = 0.01,
+    latency_ms: int = 150,
+    maker_fee_multiplier: float = 1.0,
+    prewarm_ticks: list[tuple[int, float]] = [],
+    adjuster: Optional[QuoteAdjuster] = None,
+) -> ReplayResult:
+    """Queue-aware replay with a feed-to-matching-engine latency model.
+
+    Every plan the strategy produces activates latency_ms after the decision:
+    new orders join the queue against the book as of activation, and cancelled
+    orders remain fillable until the cancel activates. An optional QuoteAdjuster
+    implements quoting variants (skew, toxicity gating) for A/B comparison.
+    """
+    if latency_ms < 0:
+        raise ValueError("latency_ms cannot be negative")
     settlement = infer_settlement(rows, market)
     book = KalshiOrderBook(market.ticker)
     brti = BrtiState()
     vol = MultiHorizonVolatility()
-    for prewarm_path in prewarm_paths:
-        for ts_ms, value in extract_brti_ticks(iter_events(prewarm_path)):
-            vol.update(ts_ms, value)
+    for ts_ms, value in prewarm_ticks:
+        vol.update(ts_ms, value)
     strategy = KalshiMakerStrategy(
         price_grid=PriceGrid(market.price_ranges),
         config=KalshiStrategyConfig(
@@ -169,6 +223,7 @@ def replay(
             maker_fee_multiplier=maker_fee_multiplier,
         ),
     )
+    trade_flow: deque[tuple[int, float]] = deque()
     simulator = ConservativeQueueSimulator()
     inventory = KalshiInventory()
     fills: list[ReplayFill] = []
@@ -221,13 +276,32 @@ def replay(
                     mids.append((ts_ms, mid))
             # While a cancel/replace is in flight, live execution cannot issue another.
             if pending_plan is None:
+                fair_yes = fair.yes
+                bid_tox = ask_tox = 0.0
+                if adjuster is not None:
+                    while trade_flow and trade_flow[0][0] < ts_ms - 5_000:
+                        trade_flow.popleft()
+                    context = QuoteContext(
+                        ts_ms=ts_ms,
+                        seconds_to_close=seconds_to_close,
+                        fair_yes=fair.yes,
+                        bbo=bbo,
+                        book=book,
+                        flow_5s=sum(count for _, count in trade_flow),
+                        flow_1s=sum(count for flow_ts, count in trade_flow if flow_ts >= ts_ms - 1_000),
+                    )
+                    fair_yes, bid_tox, ask_tox = adjuster.adjust(context)
+                    fair_yes = min(0.999, max(0.001, fair_yes))
+                    last_fair = fair_yes
                 decision = strategy.decide(
-                    fair_yes=fair.yes,
+                    fair_yes=fair_yes,
                     bbo=bbo,
                     inventory=inventory,
                     current_orders=simulator.resting(),
                     seconds_to_close=seconds_to_close,
                     data_age_ms=0,
+                    bid_toxicity_dollars=bid_tox,
+                    ask_toxicity_dollars=ask_tox,
                 )
                 if decision.plan.changed:
                     pending_plan = (ts_ms + latency_ms, decision.plan)
@@ -239,6 +313,7 @@ def replay(
             count_raw = msg.get("count_fp") or msg.get("count")
             taker_side = msg.get("taker_book_side") or msg.get("book_side")
             if price_raw is not None and count_raw is not None and taker_side in {"bid", "ask"}:
+                trade_flow.append((ts_ms, float(count_raw) if taker_side == "bid" else -float(count_raw)))
                 new_fills = simulator.trade(
                     ts_ms=ts_ms,
                     price=float(price_raw),
@@ -288,6 +363,7 @@ def replay(
         settlement_source=settlement.source if settlement else None,
         settlement_reference=settlement.reference_value if settlement else None,
         fair_mid_mae=mae,
+        mids=tuple(mids),
     )
 
 
