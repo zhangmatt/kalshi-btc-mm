@@ -237,6 +237,16 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
   all prior zero-fee results invalidated.
 - **2026-07-14** — 150ms latency became the replay default; zero-latency results
   invalidated for promotion purposes.
+- **2026-07-15 (model audit)** — Four defects found and fixed before they could bias
+  results: (1) train/val/holdout split ordered by ticker string, which scrambles
+  across month boundaries (AUG<JUL alphabetically) — now ordered by data timestamp;
+  (2) replay was blind to external venues, so A/B gates ran without T's strongest
+  features — QuoteContext now carries external microprice lead/imbalance, depth
+  deltas, trade counts; (3) fitted Model V was never money-tested — added the
+  `modelv` A/B variant; (4) toxicity gate threshold was a fixed 0.5 vs state base
+  rates of 0.15–0.35 — now keys off each bucket model's training base rate. T's
+  side-mirroring redesign (2026-07-14 evening) validated post-fix: state-trained
+  val AUC 0.70/0.82/0.64 by bucket, stable across the corrected split.
 - **2026-07-14 (fees)** — Maker fee VERIFIED = 0 for KXBTC15M from the official
   2026-07-07 schedule (§10.1 resolved). All defaults flipped from the conservative
   multiplier 1 to the true 0; taker fee corrected to centicent round-up per the
