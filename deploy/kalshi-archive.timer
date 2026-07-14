@@ -1,0 +1,13 @@
+[Unit]
+Description=Archive finalized Kalshi recordings every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

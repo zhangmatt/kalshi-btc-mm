@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import argparse
+import bisect
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+from .exchange import BrtiState, KalshiMarket, KalshiOrderBook, PriceGrid, event_contract_fee
+from .strategy import KalshiInventory, KalshiMakerStrategy, KalshiStrategyConfig, RestingKalshiOrder
+from .recorder import iter_events
+from .fair_value import kalshi_btc15m_fair_value
+from .settlement import infer_settlement
+from .volatility import MultiHorizonVolatility
+
+
+@dataclass
+class SimulatedOrder:
+    order_id: str
+    side: str
+    price: float
+    remaining: float
+    queue_ahead: float
+
+
+@dataclass(frozen=True)
+class ReplayFill:
+    ts_ms: int
+    side: str
+    price: float
+    count: float
+    fair_yes: float
+
+
+class ConservativeQueueSimulator:
+    """Fill only after observed aggressive trades exhaust displayed queue ahead."""
+
+    def __init__(self):
+        self.orders: dict[str, SimulatedOrder] = {}
+        self._next_id = 1
+
+    def replace(
+        self,
+        *,
+        cancel_ids: Iterable[str],
+        quotes: Iterable[Any],
+        bbo: Any,
+        book: Optional[KalshiOrderBook] = None,
+    ) -> None:
+        for order_id in cancel_ids:
+            self.orders.pop(order_id, None)
+        for quote in quotes:
+            order_id = f"sim-{self._next_id}"
+            self._next_id += 1
+            if book is not None:
+                queue = book.level_size(quote.side, quote.price)
+            else:
+                queue = bbo.bid_size if quote.side == "bid" and quote.price == bbo.bid else 0.0
+                queue = bbo.ask_size if quote.side == "ask" and quote.price == bbo.ask else queue
+            self.orders[order_id] = SimulatedOrder(order_id, quote.side, quote.price, quote.count, queue)
+
+    def resting(self) -> list[RestingKalshiOrder]:
+        return [RestingKalshiOrder(value.order_id, value.order_id, value.side, value.price, value.remaining) for value in self.orders.values()]
+
+    def trade(self, *, ts_ms: int, price: float, count: float, taker_book_side: str, fair_yes: float) -> list[ReplayFill]:
+        fills: list[ReplayFill] = []
+        maker_side = "bid" if taker_book_side == "ask" else "ask"
+        remaining_trade = count
+        for order in list(self.orders.values()):
+            marketable = (maker_side == "bid" and price <= order.price) or (maker_side == "ask" and price >= order.price)
+            if order.side != maker_side or not marketable or remaining_trade <= 0:
+                continue
+            consumed = min(order.queue_ahead, remaining_trade)
+            order.queue_ahead -= consumed
+            remaining_trade -= consumed
+            if order.queue_ahead > 0 or remaining_trade <= 0:
+                continue
+            filled = min(order.remaining, remaining_trade)
+            order.remaining -= filled
+            remaining_trade -= filled
+            fills.append(ReplayFill(ts_ms, order.side, order.price, filled, fair_yes))
+            if order.remaining <= 1e-9:
+                self.orders.pop(order.order_id, None)
+        return fills
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    decisions: int
+    orders_posted: int
+    contracts_posted: float
+    fills: tuple[ReplayFill, ...]
+    contracts_filled: float
+    fill_rate: float
+    final_position: float
+    cash_flow: float
+    fees_paid: float
+    gross_fair_edge: float
+    markout_1s: Optional[float]
+    markout_5s: Optional[float]
+    settlement_pnl: Optional[float]
+    settlement_result: Optional[str]
+    settlement_source: Optional[str]
+    settlement_reference: Optional[float]
+    fair_mid_mae: Optional[float]
+
+
+def _markout(fills: list[ReplayFill], mids: list[tuple[int, float]], horizon_ms: int) -> Optional[float]:
+    if not fills or not mids:
+        return None
+    timestamps = [ts_ms for ts_ms, _ in mids]
+    total = 0.0
+    contracts = 0.0
+    for fill in fills:
+        index = bisect.bisect_left(timestamps, fill.ts_ms + horizon_ms)
+        if index >= len(mids):
+            continue
+        future_mid = mids[index][1]
+        total += (future_mid - fill.price if fill.side == "bid" else fill.price - future_mid) * fill.count
+        contracts += fill.count
+    return total / contracts if contracts > 0 else None
+
+
+def replay(path: str | Path, *, min_edge_dollars: float = 0.01) -> ReplayResult:
+    rows = list(iter_events(path))
+    metadata = next((row["payload"] for row in rows if row["event_type"] == "market_metadata"), None)
+    if metadata is None:
+        raise ValueError("recording has no market_metadata event")
+    market = KalshiMarket.from_api(metadata)
+    settlement = infer_settlement(rows, market)
+    book = KalshiOrderBook(market.ticker)
+    brti = BrtiState()
+    vol = MultiHorizonVolatility()
+    strategy = KalshiMakerStrategy(
+        price_grid=PriceGrid(market.price_ranges),
+        config=KalshiStrategyConfig(min_edge_dollars=min_edge_dollars),
+    )
+    simulator = ConservativeQueueSimulator()
+    inventory = KalshiInventory()
+    fills: list[ReplayFill] = []
+    fair_mid_diffs: list[float] = []
+    mids: list[tuple[int, float]] = []
+    decisions = 0
+    orders_posted = 0
+    contracts_posted = 0.0
+    last_fair = 0.5
+    cash_flow = 0.0
+    fees_paid = 0.0
+    gross_fair_edge = 0.0
+
+    for row in rows:
+        ts_ms = int(row["receive_ts_ms"])
+        payload = row["payload"]
+        if row["source"] != "kalshi":
+            continue
+        book.apply(payload, use_yes_price=True)
+        if brti.apply(payload) and brti.value is not None:
+            vol.update(brti.source_ts_ms or ts_ms, brti.value)
+        if ts_ms / 1000.0 > market.close_ts:
+            continue
+        bbo = book.snapshot()
+        forecast = vol.forecast()
+        if bbo.valid and brti.value is not None and forecast is not None:
+            seconds_to_close = max(0.0, market.close_ts - ts_ms / 1000.0)
+            observed = brti.final_minute_values if seconds_to_close <= 60.0 else ()
+            fair = kalshi_btc15m_fair_value(
+                strike_average=market.strike_average,
+                spot=brti.value,
+                sigma_per_s=forecast.sigma_per_s,
+                seconds_to_close=seconds_to_close,
+                observed_final_values=observed,
+            )
+            last_fair = fair.yes
+            if bbo.bid is not None and bbo.ask is not None:
+                mid = (bbo.bid + bbo.ask) / 2.0
+                fair_mid_diffs.append(abs(fair.yes - mid))
+                if not mids or mids[-1] != (ts_ms, mid):
+                    mids.append((ts_ms, mid))
+            decision = strategy.decide(
+                fair_yes=fair.yes,
+                bbo=bbo,
+                inventory=inventory,
+                current_orders=simulator.resting(),
+                seconds_to_close=seconds_to_close,
+                data_age_ms=0,
+            )
+            if decision.plan.changed:
+                simulator.replace(cancel_ids=decision.plan.cancel_ids, quotes=decision.plan.post, bbo=bbo, book=book)
+                orders_posted += len(decision.plan.post)
+                contracts_posted += sum(quote.count for quote in decision.plan.post)
+            decisions += 1
+
+        if payload.get("type") == "trade":
+            msg = payload.get("msg") or {}
+            price_raw = msg.get("yes_price_dollars") or msg.get("price_dollars")
+            count_raw = msg.get("count_fp") or msg.get("count")
+            taker_side = msg.get("taker_book_side") or msg.get("book_side")
+            if price_raw is not None and count_raw is not None and taker_side in {"bid", "ask"}:
+                new_fills = simulator.trade(
+                    ts_ms=ts_ms,
+                    price=float(price_raw),
+                    count=float(count_raw),
+                    taker_book_side=str(taker_side),
+                    fair_yes=last_fair,
+                )
+                fills.extend(new_fills)
+                for fill in new_fills:
+                    delta = fill.count if fill.side == "bid" else -fill.count
+                    inventory = KalshiInventory(position=inventory.position + delta)
+                    fee = event_contract_fee(contracts=fill.count, price=fill.price, maker=True)
+                    fees_paid += fee
+                    cash_flow += (-fill.price * fill.count if fill.side == "bid" else fill.price * fill.count) - fee
+                    gross_fair_edge += (
+                        (fill.fair_yes - fill.price) if fill.side == "bid" else (fill.price - fill.fair_yes)
+                    ) * fill.count
+
+    mae = sum(fair_mid_diffs) / len(fair_mid_diffs) if fair_mid_diffs else None
+    contracts_filled = sum(fill.count for fill in fills)
+    fill_rate = contracts_filled / contracts_posted if contracts_posted > 0 else 0.0
+    settlement_pnl = None
+    if settlement is not None:
+        settlement_pnl = cash_flow + inventory.position * (1.0 if settlement.result == "yes" else 0.0)
+    return ReplayResult(
+        decisions=decisions,
+        orders_posted=orders_posted,
+        contracts_posted=contracts_posted,
+        fills=tuple(fills),
+        contracts_filled=contracts_filled,
+        fill_rate=fill_rate,
+        final_position=inventory.position,
+        cash_flow=cash_flow,
+        fees_paid=fees_paid,
+        gross_fair_edge=gross_fair_edge,
+        markout_1s=_markout(fills, mids, 1_000),
+        markout_5s=_markout(fills, mids, 5_000),
+        settlement_pnl=settlement_pnl,
+        settlement_result=settlement.result if settlement else None,
+        settlement_source=settlement.source if settlement else None,
+        settlement_reference=settlement.reference_value if settlement else None,
+        fair_mid_mae=mae,
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Replay a Kalshi BTC 15m recording conservatively.")
+    parser.add_argument("recording")
+    parser.add_argument("--min-edge", type=float, default=0.01)
+    args = parser.parse_args(argv)
+    result = replay(args.recording, min_edge_dollars=args.min_edge)
+    print(f"decisions={result.decisions}")
+    print(f"orders_posted={result.orders_posted}")
+    print(f"fills={len(result.fills)}")
+    print(f"contracts_posted={result.contracts_posted:.2f}")
+    print(f"contracts_filled={result.contracts_filled:.2f}")
+    print(f"fill_rate={result.fill_rate:.6f}")
+    print(f"final_position={result.final_position:.2f}")
+    print(f"cash_flow={result.cash_flow:.4f}")
+    print(f"fees_paid={result.fees_paid:.4f}")
+    print(f"gross_fair_edge={result.gross_fair_edge:.4f}")
+    print(f"markout_1s={result.markout_1s if result.markout_1s is not None else 'n/a'}")
+    print(f"markout_5s={result.markout_5s if result.markout_5s is not None else 'n/a'}")
+    print(f"settlement_result={result.settlement_result or 'n/a'}")
+    print(f"settlement_source={result.settlement_source or 'n/a'}")
+    print(
+        f"settlement_reference="
+        f"{result.settlement_reference if result.settlement_reference is not None else 'n/a'}"
+    )
+    print(f"settlement_pnl={result.settlement_pnl if result.settlement_pnl is not None else 'n/a'}")
+    print(f"fair_mid_mae={result.fair_mid_mae if result.fair_mid_mae is not None else 'n/a'}")
+
+
+if __name__ == "__main__":
+    main()

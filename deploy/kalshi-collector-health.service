@@ -1,0 +1,14 @@
+[Unit]
+Description=Validate the Kalshi collector's newest recording
+After=kalshi-collector.service
+OnFailure=kalshi-collector-recover.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kalshi_btc_mm
+ExecStart=/home/ubuntu/kalshi_btc_mm/.venv/bin/kalshi-mm-audit --data-dir /home/ubuntu/kalshi_btc_mm/data/kalshi --require-live
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

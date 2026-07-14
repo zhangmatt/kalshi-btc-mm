@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the Kalshi collector after a failed data audit
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart kalshi-collector.service

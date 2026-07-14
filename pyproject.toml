@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalshi-btc-mm"
+version = "0.1.0"
+description = "Settlement-aware research and maker execution for Kalshi KXBTC15M markets."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.34",
+    "certifi>=2024.2.2",
+    "cryptography>=42.0",
+    "requests>=2.31",
+    "websocket-client>=1.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+kalshi-mm-collect = "kalshi_mm.collect:main"
+kalshi-mm-audit = "kalshi_mm.audit:main"
+kalshi-mm-archive = "kalshi_mm.archive:main"
+kalshi-mm-replay = "kalshi_mm.replay:main"
+kalshi-mm-research = "kalshi_mm.research:main"
+kalshi-mm-run = "kalshi_mm.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
