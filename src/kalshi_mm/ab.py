@@ -191,7 +191,7 @@ def run_ab(
 ) -> list[WindowOutcome]:
     outcomes: list[WindowOutcome] = []
     for market, paths in group_recordings_by_market(recording_paths):
-        if not _window_is_final(paths):
+        if not _window_is_final(market, paths):
             continue
         window = _load_window(market, paths)
         rows = list(window.rows)

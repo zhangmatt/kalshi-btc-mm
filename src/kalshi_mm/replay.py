@@ -21,6 +21,11 @@ from .strategy import (
 # features.EMIT_INTERVAL_MS.
 STALE_AFTER_MS = 2_000
 DELTA_SAMPLE_MS = 250
+# Decisions are re-evaluated at most this often in event time. The live loop
+# cannot decide per book delta either (~50Hz ceiling); deciding on all ~200k
+# events per window is both unrealistic and ~20x slower (each decision prices
+# the O(60^2) settlement model).
+DECISION_INTERVAL_MS = 100
 # A markout horizon is only meaningful if a mid exists reasonably soon after
 # it; past this slack the "5s" label would silently span a data gap.
 MARKOUT_MAX_SLACK_MS = 2_000
@@ -252,6 +257,7 @@ def replay_rows(
     prev_bid_size: Optional[float] = None
     prev_ask_size: Optional[float] = None
     last_delta_sample_ms = 0
+    last_decision_ms = 0
     simulator = ConservativeQueueSimulator()
     inventory = KalshiInventory()
     fills: list[ReplayFill] = []
@@ -320,6 +326,12 @@ def replay_rows(
             and brti.source_ts_ms is not None
             and ts_ms - brti.source_ts_ms <= STALE_AFTER_MS
         )
+        # Mids record at full resolution (markout fidelity is cheap)…
+        if bbo.valid and bbo.bid is not None and bbo.ask is not None:
+            full_mid = (bbo.bid + bbo.ask) / 2.0
+            if not mids or mids[-1] != (ts_ms, full_mid):
+                mids.append((ts_ms, full_mid))
+
         pricing_ok = bbo.valid and brti_fresh and forecast is not None
         if not pricing_ok:
             if pending_plan is None and simulator.orders:
@@ -327,7 +339,9 @@ def replay_rows(
                     tuple(simulator.orders.keys()), (), "pricing unavailable"
                 )
                 pending_plan = (ts_ms + latency_ms, cancel_all)
-        else:
+        elif ts_ms - last_decision_ms >= DECISION_INTERVAL_MS:
+            # …while pricing + decisions run on the live loop's cadence.
+            last_decision_ms = ts_ms
             seconds_to_close = max(0.0, market.close_ts - ts_ms / 1000.0)
             observed = brti.final_minute_values if seconds_to_close <= 60.0 else ()
             fair = kalshi_btc15m_fair_value(
@@ -338,10 +352,7 @@ def replay_rows(
                 observed_final_values=observed,
             )
             if bbo.bid is not None and bbo.ask is not None:
-                mid = (bbo.bid + bbo.ask) / 2.0
-                fair_mid_diffs.append(abs(fair.yes - mid))
-                if not mids or mids[-1] != (ts_ms, mid):
-                    mids.append((ts_ms, mid))
+                fair_mid_diffs.append(abs(fair.yes - (bbo.bid + bbo.ask) / 2.0))
             # While a cancel/replace is in flight, live execution cannot issue another.
             if pending_plan is None:
                 fair_yes = fair.yes

@@ -303,12 +303,23 @@ def group_recordings_by_market(recording_paths: list[str | Path]) -> list[tuple[
     return [(market, sorted(paths)) for market, paths in ordered]
 
 
-def _window_is_final(paths: list[Path]) -> bool:
+def _window_is_final(market: KalshiMarket, paths: list[Path]) -> bool:
     """A window may be compacted only once closed and fully readable.
 
     Compacting an in-progress window would freeze a partial window into the
-    feature store permanently (compaction is skip-if-exists).
+    feature store permanently (compaction is skip-if-exists). For historical
+    windows (closed >1h ago, files untouched) finality is decided from
+    metadata — full-file scans of hundreds of recordings just to find close
+    markers dominated batch runtime.
     """
+    import time as _time
+
+    now = _time.time()
+    if now > market.close_ts + 3_600:
+        try:
+            return all(now - path.stat().st_mtime > 60 for path in paths)
+        except OSError:
+            return False
     closed = False
     for path in paths:
         try:
@@ -348,7 +359,7 @@ def compact_windows(
         target = out_dir / f"{market.ticker}.parquet"
         if target.exists() and not overwrite:
             continue
-        if not _window_is_final(paths):
+        if not _window_is_final(market, paths):
             print(f"[features] {market.ticker}: window not finalized; skipped", flush=True)
             continue
         window = _load_window(market, paths)

@@ -105,7 +105,7 @@ def generate_labels(
         target = out_dir / f"{market.ticker}.fills.parquet"
         if target.exists() and not overwrite:
             continue
-        if not _window_is_final(paths):
+        if not _window_is_final(market, paths):
             print(f"[labels] {market.ticker}: window not finalized; skipped", flush=True)
             continue
         window = _load_window(market, paths)
