@@ -332,13 +332,25 @@ def _window_is_final(market: KalshiMarket, paths: list[Path]) -> bool:
 
 
 def _load_window(market: KalshiMarket, paths: list[Path]) -> PreparedWindow:
-    """Load one market's fragments, stitched chronologically."""
+    """Load one market's fragments, stitched into one globally time-sorted stream.
+
+    Fragments can OVERLAP in time (a crashed process's result-finalizer appends
+    to the old file after the replacement started recording); concatenation
+    alone leaves rows non-monotonic, which silently breaks every bisect-based
+    join and forward-target lookup downstream. Python's sort is stable, so
+    equal-timestamp rows keep their within-file order.
+    """
     files = sorted(
-        ((path, list(iter_events(path))) for path in paths),
+        ((str(path), list(iter_events(path))) for path in paths),
         key=lambda item: min((int(row["receive_ts_ms"]) for row in item[1]), default=0),
     )
-    rows = tuple(row for _, file_rows in files for row in file_rows)
-    quality = _window_quality(market, rows, tuple(str(path) for path, _ in files))
+    rows = tuple(
+        sorted(
+            (row for _, file_rows in files for row in file_rows),
+            key=lambda row: int(row["receive_ts_ms"]),
+        )
+    )
+    quality = _window_quality(market, rows, tuple(path for path, _ in files))
     return PreparedWindow(market=market, rows=rows, quality=quality)
 
 

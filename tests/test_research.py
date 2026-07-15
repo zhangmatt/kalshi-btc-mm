@@ -70,6 +70,23 @@ def test_fragments_of_one_market_are_a_single_window(tmp_path):
     assert timestamps == sorted(timestamps)
 
 
+def test_overlapping_fragments_are_globally_time_sorted(tmp_path):
+    # A crashed process's finalizer can append to the OLD file after the new
+    # one started: fragment time ranges overlap, and naive concatenation
+    # leaves rows non-monotonic (breaking every bisect join downstream).
+    from kalshi_mm.features import _load_window, group_recordings_by_market
+
+    base = 1_800_000_000_000
+    first = tmp_path / "events_a.jsonl"
+    second = tmp_path / "events_b.jsonl"
+    _write_fragment(first, "KXBTC15M-TEST", base)
+    _write_fragment(second, "KXBTC15M-TEST", base + 10)  # overlaps first's range
+    ((market, paths),) = group_recordings_by_market([str(first), str(second)])
+    window = _load_window(market, paths)
+    timestamps = [int(row["receive_ts_ms"]) for row in window.rows]
+    assert timestamps == sorted(timestamps)
+
+
 def test_reconnects_flag_window(tmp_path):
     path = tmp_path / "events_a.jsonl"
     _write_fragment(path, "KXBTC15M-TEST", 1_800_000_000_000, reconnects=1)
