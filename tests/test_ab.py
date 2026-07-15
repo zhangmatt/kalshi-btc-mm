@@ -66,9 +66,28 @@ def test_toxicity_gate_penalizes_leaned_against_side(tmp_path):
     assert gate.adjust(far) == (ctx.fair_yes, 0.0, 0.0)
 
 
+def test_composed_adjuster_applies_skew_and_taxes(tmp_path):
+    from kalshi_mm.ab import ComposedAdjuster
+    from kalshi_mm.models import T_MIRRORED_FEATURES, save_models, load_models
+
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(800, len(T_MIRRORED_FEATURES)))
+    y = (x[:, 0] > 0).astype(float)
+    model = fit_logistic(x, y, features=T_MIRRORED_FEATURES, bucket=(300.0, 600.0), l2=1e-3)
+    path = tmp_path / "t.json"
+    save_models([model], path)
+    combo = ComposedAdjuster([MicropriceSkew(0.25), ToxicityGate(load_models(path))], "combo25")
+    ctx = _context(bid_size=10.0, ask_size=30.0)  # ask-heavy: micro below mid, bids toxic
+    fair, bid_tox, ask_tox = combo.adjust(ctx)
+    assert fair < ctx.fair_yes  # skew applied
+    assert bid_tox > ask_tox >= 0.0  # gate applied on the adverse side
+
+
 def test_build_variants_parses_spec(tmp_path):
     variants = build_variants("baseline,micro25,micro50", None)
     assert [v.name for v in variants] == ["baseline", "micro25", "micro50"]
+    with pytest.raises(SystemExit):
+        build_variants("combo25", None)
     with pytest.raises(SystemExit):
         build_variants("toxgate", str(tmp_path / "missing.json"))
     with pytest.raises(SystemExit):

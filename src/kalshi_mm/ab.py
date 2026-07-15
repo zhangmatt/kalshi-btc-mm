@@ -133,6 +133,25 @@ class ToxicityGate(QuoteAdjuster):
         return ctx.fair_yes, taxes["bid"], taxes["ask"]
 
 
+class ComposedAdjuster(QuoteAdjuster):
+    """Chain adjusters: fair adjustments apply sequentially, taxes accumulate."""
+
+    def __init__(self, parts: list[QuoteAdjuster], name: str):
+        self.parts = parts
+        self.name = name
+
+    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+        fair = ctx.fair_yes
+        bid_tox = ask_tox = 0.0
+        for part in self.parts:
+            from dataclasses import replace
+
+            fair, part_bid, part_ask = part.adjust(replace(ctx, fair_yes=fair))
+            bid_tox += part_bid
+            ask_tox += part_ask
+        return fair, bid_tox, ask_tox
+
+
 def build_variants(
     spec: str, model_t_path: Optional[str], model_v_path: Optional[str] = None
 ) -> list[QuoteAdjuster]:
@@ -147,6 +166,16 @@ def build_variants(
             if not model_t_path or not Path(model_t_path).exists():
                 raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
             variants.append(ToxicityGate(load_models(model_t_path)))
+        elif name.startswith("combo"):
+            # comboNN = microprice skew at NN% + toxicity gate, composed.
+            if not model_t_path or not Path(model_t_path).exists():
+                raise SystemExit("combo variant requires --model-t pointing at a model_t json")
+            weight = int(name[5:]) / 100.0
+            variants.append(
+                ComposedAdjuster(
+                    [MicropriceSkew(weight), ToxicityGate(load_models(model_t_path))], name
+                )
+            )
         elif name == "modelv":
             if not model_v_path or not Path(model_v_path).exists():
                 raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
