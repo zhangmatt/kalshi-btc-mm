@@ -218,7 +218,9 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
 - Queue simulation is conservative on queue position, and cancel-in-flight fills are now
   modeled, but self-fill price improvement is not.
 - Paper fills come from the same queue simulator — paper validates operations and state
-  machines, not fill economics.
+  machines, not fill economics. Paper order placement is also instantaneous (no
+  network round-trip), so paper fills are slightly more optimistic than replay's
+  latency-modeled fills; live placement has real latency inherently.
 - The volatility forecaster's 1800s horizon never fills within one window; cross-window
   warm-start (implemented) mitigates but regime shifts at window boundaries remain.
 - One clean recorded exchange outage/halt has never been observed; behavior under a Kalshi

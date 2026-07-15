@@ -199,7 +199,10 @@ def _fill_auc_brier(
         target = row.get(T_TARGET)
         if mirrored is None or target is None:
             continue
-        p = model.predict([mirrored.get(name) for name in model.features])
+        # Evaluate the model exactly as deployed: the ToxicityGate imputes
+        # missing features to the training mean, so validation must too —
+        # otherwise reported AUC covers only the feature-complete subset.
+        p = model.predict([mirrored.get(name) for name in model.features], impute_missing=True)
         if p is not None:
             pairs.append((p, float(target)))
     auc = _auc(pairs)
