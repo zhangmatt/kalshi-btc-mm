@@ -72,7 +72,9 @@ def context_raw_features(ctx: QuoteContext) -> dict[str, Optional[float]]:
         "spread": (bbo.ask - bbo.bid) if bbo.bid is not None and bbo.ask is not None else None,
         "gbm_fair_minus_mid": (ctx.fair_yes - mid) if mid is not None else 0.0,
         "trades_5s": float(ctx.trades_5s),
-        "jump_ratio": 0.0,
+        # None + impute_missing=True standardizes to the training mean —
+        # actually neutral, unlike a raw 0.0 which is (0-mean)/std biased.
+        "jump_ratio": None,
     }
 
 
@@ -167,6 +169,18 @@ class WindowOutcome:
     fees: float
     settlement_pnl: Optional[float]
 
+    @property
+    def markout_dollars(self) -> float:
+        """Total (not per-contract) 5s markout; 0 when the variant did not trade.
+
+        Pairing per-contract markouts drops zero-fill windows from the diff —
+        which would credit a gate for its best behavior (not trading toxic
+        windows) by excluding exactly those windows. Dollars keep them at 0.
+        """
+        if self.markout_5s is None:
+            return 0.0
+        return self.markout_5s * self.contracts
+
 
 def run_ab(
     recording_paths: list[str | Path],
@@ -217,8 +231,11 @@ def summarize(outcomes: list[WindowOutcome]) -> None:
     if "baseline" not in by_variant:
         return
     baseline = by_variant["baseline"]
-    print("\n== A/B summary (per-window means, block-bootstrap 95% CI on diff vs baseline) ==")
-    print(f"{'variant':>10s} {'windows':>7s} {'fills/w':>8s} {'markout5s':>10s} {'settle_pnl/w':>12s} {'d_markout (CI)':>28s} {'d_settle (CI)':>28s}")
+    print("\n== A/B summary (per-window, block-bootstrap 95% CI on diff vs baseline) ==")
+    print(
+        f"{'variant':>10s} {'windows':>7s} {'fills/w':>8s} {'markout5s':>10s} {'settle_pnl/w':>12s} "
+        f"{'d_markout$ (CI)':>28s} {'d_settle (CI)':>28s}"
+    )
     for variant, windows in by_variant.items():
         shared = [ticker for ticker in windows if ticker in baseline]
         fills = sum(windows[t].fills for t in shared) / max(1, len(shared))
@@ -229,11 +246,9 @@ def summarize(outcomes: list[WindowOutcome]) -> None:
         if variant == "baseline":
             print(f"{variant:>10s} {len(shared):7d} {fills:8.1f} {mean_markout:10.4f} {mean_settle:12.3f} {'—':>28s} {'—':>28s}")
             continue
-        d_markout = [
-            windows[t].markout_5s - baseline[t].markout_5s
-            for t in shared
-            if windows[t].markout_5s is not None and baseline[t].markout_5s is not None
-        ]
+        # Markout diffs in DOLLARS so zero-fill windows count as 0 instead of
+        # being dropped (a gate must not be graded only on windows it traded).
+        d_markout = [windows[t].markout_dollars - baseline[t].markout_dollars for t in shared]
         d_settle = [
             windows[t].settlement_pnl - baseline[t].settlement_pnl
             for t in shared
@@ -243,7 +258,7 @@ def summarize(outcomes: list[WindowOutcome]) -> None:
         s_mean, s_low, s_high = block_bootstrap_ci(d_settle)
         print(
             f"{variant:>10s} {len(shared):7d} {fills:8.1f} {mean_markout:10.4f} {mean_settle:12.3f} "
-            f"{f'{m_mean:+.4f} [{m_low:+.4f},{m_high:+.4f}]':>28s} "
+            f"{f'{m_mean:+.3f} [{m_low:+.3f},{m_high:+.3f}]':>28s} "
             f"{f'{s_mean:+.3f} [{s_low:+.3f},{s_high:+.3f}]':>28s}"
         )
 

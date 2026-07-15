@@ -58,7 +58,9 @@ def infer_settlement(rows: Iterable[Mapping[str, Any]], market: KalshiMarket) ->
             average = float(final["value"])
         except (KeyError, TypeError, ValueError):
             continue
-        if count >= 60 and abs(window_end_ms - close_ms) <= 1_000:
+        # Observed feeds publish window_end exactly at close; a loose tolerance
+        # could accept an average offset by one fixing on a knife-edge market.
+        if count >= 60 and abs(window_end_ms - close_ms) <= 250:
             if complete_average is None or window_end_ms > complete_average[0]:
                 complete_average = (window_end_ms, average)
 

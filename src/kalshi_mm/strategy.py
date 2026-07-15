@@ -68,6 +68,8 @@ class KalshiStrategyConfig:
             raise ValueError("cash limits are invalid")
         if not 0.0 < self.requote_remaining_fraction <= 1.0:
             raise ValueError("requote_remaining_fraction must be in (0, 1]")
+        if self.min_edge_dollars <= 0:
+            raise ValueError("min_edge_dollars must be positive (zero permits self-crossing quotes)")
 
 
 @dataclass(frozen=True)
@@ -112,7 +114,7 @@ class KalshiMakerStrategy:
         if bid_count > 0:
             bid_edge = self.config.min_edge_dollars + max(0.0, bid_toxicity_dollars)
             bid = self.price_grid.floor(reservation - bid_edge)
-            bid = min(bid, self.price_grid.floor(bbo.ask - self.price_grid.step(bbo.ask)))
+            bid = min(bid, self.price_grid.tick_below(bbo.ask))
             fee = maker_fee_rate(price=bid, multiplier=self.config.maker_fee_multiplier)
             edge = reservation - bid - fee - max(0.0, bid_toxicity_dollars)
             bid_count = min(bid_count, self.config.max_quote_notional_dollars / max(0.001, bid))
@@ -124,7 +126,7 @@ class KalshiMakerStrategy:
         if ask_count > 0:
             ask_edge = self.config.min_edge_dollars + max(0.0, ask_toxicity_dollars)
             ask = self.price_grid.ceil(reservation + ask_edge)
-            ask = max(ask, self.price_grid.ceil(bbo.bid + self.price_grid.step(bbo.bid)))
+            ask = max(ask, self.price_grid.tick_above(bbo.bid))
             fee = maker_fee_rate(price=ask, multiplier=self.config.maker_fee_multiplier)
             edge = ask - reservation - fee - max(0.0, ask_toxicity_dollars)
             ask_collateral = max(0.001, 1.0 - ask)
@@ -135,6 +137,10 @@ class KalshiMakerStrategy:
         # Sub-minimum quotes (e.g. inventory-room dust near the position cap) are
         # never worth posting and would churn against the keep floor forever.
         desired = [quote for quote in desired if quote.count >= self.config.min_order_count]
+        # Never emit a self-crossing pair regardless of rounding interactions.
+        sides = {quote.side: quote for quote in desired}
+        if "bid" in sides and "ask" in sides and sides["ask"].price <= sides["bid"].price:
+            desired = [sides["bid"]]
 
         if inventory.cash_dollars is not None and desired:
             available = max(0.0, inventory.cash_dollars - self.config.cash_reserve_dollars)
@@ -159,28 +165,31 @@ class KalshiMakerStrategy:
 
     def _plan(self, current: tuple[RestingKalshiOrder, ...], desired: list[KalshiQuote]) -> KalshiQuotePlan:
         desired_by_side = {quote.side: quote for quote in desired}
-        current_by_side = {order.side: order for order in current}
+        current_by_side: dict[str, list[RestingKalshiOrder]] = {}
+        for order in current:
+            current_by_side.setdefault(order.side, []).append(order)
         cancel: list[str] = []
-        post: list[KalshiQuote] = []
-        for side, order in current_by_side.items():
+        kept_sides: set[str] = set()
+        for side, orders in current_by_side.items():
             target = desired_by_side.get(side)
-            if target is None or abs(target.price - order.price) > 1e-9:
-                cancel.append(order.order_id)
-                continue
-            # Cancel/repost forfeits queue priority, so tolerate a partially
-            # filled or slightly oversized resting order at the right price.
-            # The floor is clamped by the target so a freshly posted order can
-            # always satisfy it (otherwise a sub-floor target churns forever).
-            keep_floor = min(
-                target.count,
-                max(self.config.min_order_count, self.config.requote_remaining_fraction * target.count),
-            )
-            if order.remaining_count + 1e-9 < keep_floor:
-                cancel.append(order.order_id)
-        for side, target in desired_by_side.items():
-            order = current_by_side.get(side)
-            if order is None or order.order_id in cancel:
-                post.append(target)
+            # At most one resting order per side may survive; duplicates (e.g.
+            # after a restart or a presumed-failed post that actually landed)
+            # must be cancelled or they escape position-cap accounting.
+            keeper: Optional[RestingKalshiOrder] = None
+            if target is not None:
+                keep_floor = min(
+                    target.count,
+                    max(self.config.min_order_count, self.config.requote_remaining_fraction * target.count),
+                )
+                for order in orders:
+                    if keeper is None and abs(target.price - order.price) <= 1e-9 and order.remaining_count + 1e-9 >= keep_floor:
+                        keeper = order
+            for order in orders:
+                if order is not keeper:
+                    cancel.append(order.order_id)
+            if keeper is not None:
+                kept_sides.add(side)
+        post = [target for side, target in desired_by_side.items() if side not in kept_sides]
         reason = "quote changed" if cancel or post else "unchanged"
         return KalshiQuotePlan(tuple(cancel), tuple(post), reason)
 

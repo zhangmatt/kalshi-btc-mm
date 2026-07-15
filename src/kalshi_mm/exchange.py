@@ -88,6 +88,19 @@ class PriceGrid:
     def ceil(self, price: float) -> float:
         return self._round(price, up=True)
 
+    def tick_below(self, price: float) -> float:
+        """Largest grid price strictly below `price`.
+
+        floor(price - step(price)) is wrong at taper boundaries: step(0.01)
+        returns the coarse upper-range step, jumping eight fine ticks instead
+        of one. Nudging below the boundary first picks up the correct range.
+        """
+        return self.floor(price - 1e-9)
+
+    def tick_above(self, price: float) -> float:
+        """Smallest grid price strictly above `price`."""
+        return self.ceil(price + 1e-9)
+
     def _round(self, price: float, *, up: bool) -> float:
         bounded = min(0.999, max(0.001, price))
         for index, item in enumerate(self.ranges):
@@ -95,7 +108,12 @@ class PriceGrid:
                 units = (bounded - item.start) / item.step
                 rounded = math.ceil(units - 1e-10) if up else math.floor(units + 1e-10)
                 return round(item.start + rounded * item.step, 4)
-        raise ValueError(f"price {price} is outside configured ranges")
+        # Metadata with ranges narrower than [0.001, 0.999] (e.g. a plain cent
+        # grid): clamp to the nearest configured edge instead of crashing the
+        # quote loop mid-session.
+        if bounded < self.ranges[0].start:
+            return self.ranges[0].start
+        return round(self.ranges[-1].end, 4)
 
 
 @dataclass(frozen=True)
@@ -491,10 +509,10 @@ class BrtiState:
                 self.final_minute_average = float(final["value"])
                 self.final_minute_count = count
                 self.final_minute_values = [self.final_minute_average] * count
-            else:
-                self.final_minute_values.clear()
-                self.final_minute_average = None
-                self.final_minute_count = 0
+            # A tick that merely omits the field must not wipe observed state:
+            # inside the final minute that would snap fair value back to the
+            # unconditioned model. State is per-market (fresh each window), so
+            # keeping the last published partial average is safe.
         return True
 
     def snapshot(self) -> "BrtiSnapshot":

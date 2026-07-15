@@ -8,7 +8,22 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .exchange import BrtiState, KalshiMarket, KalshiOrderBook, PriceGrid, event_contract_fee
-from .strategy import KalshiInventory, KalshiMakerStrategy, KalshiStrategyConfig, RestingKalshiOrder
+from .strategy import (
+    KalshiInventory,
+    KalshiMakerStrategy,
+    KalshiQuotePlan,
+    KalshiStrategyConfig,
+    RestingKalshiOrder,
+)
+
+# Mirrors the live runner's stale-data gate and the feature store's sampling
+# cadence; keep in sync with KalshiStrategyConfig.stale_after_ms and
+# features.EMIT_INTERVAL_MS.
+STALE_AFTER_MS = 2_000
+DELTA_SAMPLE_MS = 250
+# A markout horizon is only meaningful if a mid exists reasonably soon after
+# it; past this slack the "5s" label would silently span a data gap.
+MARKOUT_MAX_SLACK_MS = 2_000
 from .recorder import iter_events
 from .fair_value import kalshi_btc15m_fair_value
 from .settlement import infer_settlement
@@ -118,6 +133,10 @@ def _markout(fills: list[ReplayFill], mids: list[tuple[int, float]], horizon_ms:
     for fill in fills:
         index = bisect.bisect_left(timestamps, fill.ts_ms + horizon_ms)
         if index >= len(mids):
+            continue
+        # Bound the match: without this, a data gap turns a "5s" markout into
+        # a much longer one measured at whatever mid appears after the gap.
+        if mids[index][0] > fill.ts_ms + horizon_ms + MARKOUT_MAX_SLACK_MS:
             continue
         future_mid = mids[index][1]
         total += (future_mid - fill.price if fill.side == "bid" else fill.price - future_mid) * fill.count
@@ -232,6 +251,7 @@ def replay_rows(
     external_books: dict[str, tuple[int, Optional[float], Optional[float]]] = {}
     prev_bid_size: Optional[float] = None
     prev_ask_size: Optional[float] = None
+    last_delta_sample_ms = 0
     simulator = ConservativeQueueSimulator()
     inventory = KalshiInventory()
     fills: list[ReplayFill] = []
@@ -272,13 +292,42 @@ def replay_rows(
 
         if pending_plan is not None and ts_ms >= pending_plan[0]:
             plan = pending_plan[1]
-            simulator.replace(cancel_ids=plan.cancel_ids, quotes=plan.post, bbo=bbo, book=book)
-            orders_posted += len(plan.post)
-            contracts_posted += sum(quote.count for quote in plan.post)
+            # Post-only validation at activation: the engine rejects orders
+            # whose price crossed during the latency window, and an invalid
+            # book means live could not have safely rested anything.
+            accepted = []
+            if bbo.valid and bbo.bid is not None and bbo.ask is not None:
+                for quote in plan.post:
+                    if quote.side == "bid" and quote.price < bbo.ask:
+                        accepted.append(quote)
+                    elif quote.side == "ask" and quote.price > bbo.bid:
+                        accepted.append(quote)
+            simulator.replace(
+                cancel_ids=plan.cancel_ids,
+                quotes=accepted,
+                bbo=bbo,
+                book=book if bbo.valid else None,
+            )
+            orders_posted += len(accepted)
+            contracts_posted += sum(quote.count for quote in accepted)
             pending_plan = None
 
         forecast = vol.forecast()
-        if bbo.valid and brti.value is not None and forecast is not None:
+        # Mirror the live runner's gates: an invalid book or stale BRTI makes
+        # pricing unavailable, and live safety-cancels all resting orders.
+        brti_fresh = (
+            brti.value is not None
+            and brti.source_ts_ms is not None
+            and ts_ms - brti.source_ts_ms <= STALE_AFTER_MS
+        )
+        pricing_ok = bbo.valid and brti_fresh and forecast is not None
+        if not pricing_ok:
+            if pending_plan is None and simulator.orders:
+                cancel_all = KalshiQuotePlan(
+                    tuple(simulator.orders.keys()), (), "pricing unavailable"
+                )
+                pending_plan = (ts_ms + latency_ms, cancel_all)
+        else:
             seconds_to_close = max(0.0, market.close_ts - ts_ms / 1000.0)
             observed = brti.final_minute_values if seconds_to_close <= 60.0 else ()
             fair = kalshi_btc15m_fair_value(
@@ -288,7 +337,6 @@ def replay_rows(
                 seconds_to_close=seconds_to_close,
                 observed_final_values=observed,
             )
-            last_fair = fair.yes
             if bbo.bid is not None and bbo.ask is not None:
                 mid = (bbo.bid + bbo.ask) / 2.0
                 fair_mid_diffs.append(abs(fair.yes - mid))
@@ -299,8 +347,6 @@ def replay_rows(
                 fair_yes = fair.yes
                 bid_tox = ask_tox = 0.0
                 if adjuster is not None:
-                    while trade_flow and trade_flow[0][0] < ts_ms - 5_000:
-                        trade_flow.popleft()
                     micro_leads = [
                         (micro - brti.value) / brti.value * 10_000
                         for venue_ts, micro, _ in external_books.values()
@@ -325,10 +371,15 @@ def replay_rows(
                         ext_micro_lead_bps=sorted(micro_leads)[len(micro_leads) // 2] if micro_leads else None,
                         ext_imbalance=sorted(ext_imbs)[len(ext_imbs) // 2] if ext_imbs else None,
                     )
-                    prev_bid_size, prev_ask_size = bbo.bid_size, bbo.ask_size
+                    # Deltas sample on the feature store's cadence so training
+                    # and consumption see the same timescale.
+                    if last_delta_sample_ms == 0 or ts_ms - last_delta_sample_ms >= DELTA_SAMPLE_MS:
+                        prev_bid_size, prev_ask_size = bbo.bid_size, bbo.ask_size
+                        last_delta_sample_ms = ts_ms
                     fair_yes, bid_tox, ask_tox = adjuster.adjust(context)
                     fair_yes = min(0.999, max(0.001, fair_yes))
-                    last_fair = fair_yes
+                # The fair attached to fills is the one orders were quoted at.
+                last_fair = fair_yes
                 decision = strategy.decide(
                     fair_yes=fair_yes,
                     bbo=bbo,
@@ -345,11 +396,15 @@ def replay_rows(
 
         if payload.get("type") == "trade":
             msg = payload.get("msg") or {}
+            if msg.get("market_ticker") != market.ticker:
+                continue
             price_raw = msg.get("yes_price_dollars") or msg.get("price_dollars")
             count_raw = msg.get("count_fp") or msg.get("count")
             taker_side = msg.get("taker_book_side") or msg.get("book_side")
             if price_raw is not None and count_raw is not None and taker_side in {"bid", "ask"}:
                 trade_flow.append((ts_ms, float(count_raw) if taker_side == "bid" else -float(count_raw)))
+                while trade_flow and trade_flow[0][0] < ts_ms - 5_000:
+                    trade_flow.popleft()
                 new_fills = simulator.trade(
                     ts_ms=ts_ms,
                     price=float(price_raw),

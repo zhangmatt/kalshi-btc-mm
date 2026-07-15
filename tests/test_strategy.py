@@ -149,6 +149,47 @@ def test_resting_order_matching_its_own_target_is_kept():
     assert "b" not in decision.plan.cancel_ids
 
 
+def test_duplicate_same_side_orders_are_all_cancelled_but_one():
+    # Two resting bids (restart / presumed-failed post that landed): exactly
+    # one may survive; the shadowed one must be cancelled, not forgotten.
+    current = [
+        RestingKalshiOrder("b1", "b1", "bid", 0.49, 5),
+        RestingKalshiOrder("b2", "b2", "bid", 0.48, 5),
+        RestingKalshiOrder("a", "a", "ask", 0.51, 5),
+    ]
+    decision = strategy().decide(
+        fair_yes=0.50,
+        bbo=KalshiBbo(0.49, 0.51, valid=True),
+        inventory=KalshiInventory(),
+        current_orders=current,
+        seconds_to_close=600,
+        data_age_ms=10,
+    )
+    assert "b2" in decision.plan.cancel_ids  # wrong price -> cancelled
+    assert "b1" not in decision.plan.cancel_ids  # matches target -> kept
+    # Duplicates at the SAME correct price: keep one, cancel the rest.
+    dupes = [
+        RestingKalshiOrder("b1", "b1", "bid", 0.49, 5),
+        RestingKalshiOrder("b2", "b2", "bid", 0.49, 5),
+    ]
+    decision = strategy().decide(
+        fair_yes=0.50,
+        bbo=KalshiBbo(0.49, 0.51, valid=True),
+        inventory=KalshiInventory(),
+        current_orders=dupes,
+        seconds_to_close=600,
+        data_age_ms=10,
+    )
+    assert len(set(decision.plan.cancel_ids) & {"b1", "b2"}) == 1
+
+
+def test_zero_min_edge_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="min_edge"):
+        KalshiStrategyConfig(min_edge_dollars=0.0)
+
+
 def test_available_cash_caps_combined_collateral():
     maker = KalshiMakerStrategy(
         price_grid=PriceGrid([PriceRange(0, 1, 0.01)]),

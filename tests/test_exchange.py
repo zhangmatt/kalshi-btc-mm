@@ -42,6 +42,11 @@ def test_market_and_tapered_price_grid():
     assert grid.ceil(0.506) == 0.51
     assert grid.step(0.10) == 0.01
     assert grid.step(0.90) == 0.001
+    # Taper boundaries: one tick below 0.01 is 0.009 (fine tail), not 0.001.
+    assert grid.tick_below(0.01) == 0.009
+    assert grid.tick_below(0.5) == 0.49
+    assert grid.tick_above(0.9) == 0.901
+    assert grid.tick_above(0.49) == 0.50
 
 
 def test_order_book_applies_yes_scale_snapshot_and_detects_gap():
@@ -77,6 +82,29 @@ def test_order_book_applies_yes_scale_snapshot_and_detects_gap():
         }
     )
     assert not book.snapshot().valid
+
+
+def test_brti_state_retains_partial_average_when_field_is_omitted():
+    state = BrtiState()
+    state.apply(
+        {
+            "type": "cfbenchmarks_value",
+            "msg": {
+                "index_id": "BRTI",
+                "data": json.dumps({"time": 1, "value": "100.0"}),
+                "last_60s_windowed_average_15min": {"value": "100.2", "window_size": 10},
+            },
+        }
+    )
+    # A tick without the field must not wipe observed final-minute state.
+    state.apply(
+        {
+            "type": "cfbenchmarks_value",
+            "msg": {"index_id": "BRTI", "data": json.dumps({"time": 2, "value": "100.1"})},
+        }
+    )
+    assert state.final_minute_count == 10
+    assert state.final_minute_average == 100.2
 
 
 def test_brti_state_uses_published_partial_average_and_count():

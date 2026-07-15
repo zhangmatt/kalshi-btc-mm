@@ -53,6 +53,31 @@ def test_fill_labels_side_adjust_markout_and_join_features():
     assert ask_row["toxic_5s"] == 0.0
 
 
+def test_feature_row_at_fill_timestamp_is_not_joined():
+    # A row emitted at the fill's own ts contains the causal trade in its flow
+    # features (leakage); the join must use strictly earlier rows.
+    fills = [ReplayFill(ts_ms=10_000, side="bid", price=0.49, count=1.0, fair_yes=0.5)]
+    mids = [(9_000, 0.50), (11_500, 0.50), (15_200, 0.50)]
+    features = [
+        {"ts_ms": 9_750, "seconds_to_close": 400.0, "imb_top1": 0.1},
+        {"ts_ms": 10_000, "seconds_to_close": 400.0, "imb_top1": -0.9},  # contains the fill's trade
+    ]
+    (row,) = fill_label_rows(_result(fills, mids), features, ticker="T")
+    assert row["imb_top1"] == 0.1
+    assert row["feature_age_ms"] == 250
+
+
+def test_markout_is_none_across_data_gaps():
+    fills = [ReplayFill(ts_ms=10_000, side="bid", price=0.49, count=1.0, fair_yes=0.5)]
+    # Next mid after the 5s horizon is 40s later (gap) -> no 5s label.
+    mids = [(9_000, 0.50), (11_500, 0.50), (50_000, 0.30)]
+    features = [{"ts_ms": 9_800, "seconds_to_close": 400.0}]
+    (row,) = fill_label_rows(_result(fills, mids), features, ticker="T")
+    assert row["markout_1s"] == pytest.approx(0.01)
+    assert row["markout_5s"] is None
+    assert row["toxic_5s"] is None
+
+
 def test_stale_features_are_not_joined():
     fills = [ReplayFill(ts_ms=50_000, side="bid", price=0.49, count=1.0, fair_yes=0.5)]
     mids = [(49_000, 0.50), (56_000, 0.50)]

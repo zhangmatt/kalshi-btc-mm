@@ -24,6 +24,7 @@ from .volatility import MultiHorizonVolatility
 
 EMIT_INTERVAL_MS = 250
 TARGET_HORIZONS_MS = (1_000, 5_000, 30_000)
+TARGET_MAX_SLACK_MS = 1_500
 EXTERNAL_VENUES = ("binance", "coinbase", "kraken")
 EXTERNAL_MAX_AGE_MS = 2_000
 SCHEMA_VERSION = 1
@@ -226,7 +227,16 @@ def window_feature_rows(window: PreparedWindow) -> list[dict[str, Any]]:
         for horizon in TARGET_HORIZONS_MS:
             key = f"fwd_mid_delta_{horizon // 1000}s"
             target_index = bisect.bisect_left(timestamps, row["ts_ms"] + horizon)
-            row[key] = mids[target_index] - mids[index] if target_index < len(mids) else None
+            # A bounded match only: across an emission gap (invalid book, feed
+            # outage) the next row may be much later than the horizon, and the
+            # label would silently measure a far longer move.
+            if (
+                target_index < len(mids)
+                and timestamps[target_index] <= row["ts_ms"] + horizon + TARGET_MAX_SLACK_MS
+            ):
+                row[key] = mids[target_index] - mids[index]
+            else:
+                row[key] = None
     return rows_out
 
 
@@ -262,7 +272,11 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = sorted({key for row in rows for key in row})
     table = pa.table({column: [row.get(column) for row in rows] for column in columns})
-    pq.write_table(table, path)
+    # Atomic write: a kill mid-write must never leave a truncated file that
+    # skip-if-exists compaction would then freeze into the store forever.
+    temporary = path.with_name(path.name + ".tmp")
+    pq.write_table(table, temporary)
+    temporary.replace(path)
 
 
 def _read_market(path: str | Path) -> Optional[KalshiMarket]:

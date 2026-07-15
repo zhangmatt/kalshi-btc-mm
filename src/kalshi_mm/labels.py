@@ -32,6 +32,9 @@ TOXIC_MARKOUT_DOLLARS = -0.01
 FEATURE_JOIN_MAX_AGE_MS = 2_000
 
 
+MARKOUT_MAX_SLACK_MS = 2_000
+
+
 def _markout_at(
     fill_ts: int, fill_price: float, side: str, mids: list[tuple[int, float]], horizon_ms: int
 ) -> Optional[float]:
@@ -39,6 +42,8 @@ def _markout_at(
     index = bisect.bisect_left(timestamps, fill_ts + horizon_ms)
     if index >= len(mids):
         return None
+    if mids[index][0] > fill_ts + horizon_ms + MARKOUT_MAX_SLACK_MS:
+        return None  # a data gap would silently stretch the horizon
     future_mid = mids[index][1]
     return future_mid - fill_price if side == "bid" else fill_price - future_mid
 
@@ -54,7 +59,11 @@ def fill_label_rows(
     feature_ts = [row["ts_ms"] for row in feature_rows]
     out: list[dict[str, Any]] = []
     for fill in result.fills:
-        index = bisect.bisect_right(feature_ts, fill.ts_ms) - 1
+        # Strictly BEFORE the fill: a feature row emitted at the fill's own
+        # timestamp already contains the aggressor trade that caused the fill
+        # in its flow features — information the live gate cannot have when it
+        # quotes. Joining it would leak the label into the features.
+        index = bisect.bisect_left(feature_ts, fill.ts_ms) - 1
         if index < 0 or fill.ts_ms - feature_ts[index] > FEATURE_JOIN_MAX_AGE_MS:
             continue
         features = dict(feature_rows[index])

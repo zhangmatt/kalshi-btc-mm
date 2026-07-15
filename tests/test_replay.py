@@ -128,6 +128,101 @@ def test_adjuster_context_carries_external_and_depth_state(tmp_path):
     assert any(ctx.trades_5s >= 1 for ctx in captured)
 
 
+def test_crossed_posts_are_rejected_at_activation(tmp_path):
+    """A bid whose price the market crossed during the latency window must not rest."""
+    from kalshi_mm.exchange import KalshiMarket
+    from kalshi_mm.recorder import iter_events
+    from kalshi_mm.replay import replay_rows
+
+    path = tmp_path / "events.jsonl"
+    _write_latency_fixture(path)
+    rows = list(iter_events(path))
+    metadata = next(row["payload"] for row in rows if row["event_type"] == "market_metadata")
+    market = KalshiMarket.from_api(metadata)
+    # During the 150ms flight after the +3000ms decision (bid 0.48 pending),
+    # the ask collapses to 0.45 — live post_only would reject the bid.
+    crash_ts = 1_800_000_000 * 1000 + 3_050
+    crash = {
+        "receive_ts_ms": crash_ts,
+        "source": "kalshi",
+        "event_type": "orderbook_snapshot",
+        "payload": {
+            "type": "orderbook_snapshot",
+            "seq": 2,
+            "msg": {
+                "market_ticker": "KXBTC15M-TEST",
+                "yes_dollars_fp": [["0.40", "5"]],
+                "no_dollars_fp": [["0.45", "5"]],
+            },
+        },
+    }
+    index = next(i for i, row in enumerate(rows) if int(row["receive_ts_ms"]) > crash_ts)
+    rows.insert(index, crash)
+    result = replay_rows(market, rows, latency_ms=150, maker_fee_multiplier=0.0)
+    # The 0.48 bid must have been rejected at activation: no fill at 0.48.
+    assert all(fill.price != 0.48 for fill in result.fills)
+
+
+def test_stale_brti_cancels_resting_orders(tmp_path):
+    """Orders must not keep filling through a BRTI outage live would cancel on."""
+    from kalshi_mm.exchange import KalshiMarket
+    from kalshi_mm.recorder import iter_events
+    from kalshi_mm.replay import replay_rows
+
+    path = tmp_path / "events.jsonl"
+    _write_latency_fixture(path)
+    rows = list(iter_events(path))
+    metadata = next(row["payload"] for row in rows if row["event_type"] == "market_metadata")
+    market = KalshiMarket.from_api(metadata)
+    base = 1_800_000_000 * 1000
+    # Delta keeps the book alive at +9s (trades no longer needed) while BRTI
+    # is silent since +4s -> stale by >2s -> pending cancel-all at +9s...
+    rows.append(
+        {
+            "receive_ts_ms": base + 9_000,
+            "source": "kalshi",
+            "event_type": "orderbook_delta",
+            "payload": {
+                "type": "orderbook_delta",
+                "seq": 2,
+                "msg": {"market_ticker": "KXBTC15M-TEST", "side": "yes", "price_dollars": "0.40", "delta_fp": "1"},
+            },
+        }
+    )
+    rows.append(
+        {
+            "receive_ts_ms": base + 9_300,
+            "source": "kalshi",
+            "event_type": "orderbook_delta",
+            "payload": {
+                "type": "orderbook_delta",
+                "seq": 3,
+                "msg": {"market_ticker": "KXBTC15M-TEST", "side": "yes", "price_dollars": "0.40", "delta_fp": "1"},
+            },
+        }
+    )
+    # ...then a trade at +10s that would have filled the (now cancelled) bid.
+    rows.append(
+        {
+            "receive_ts_ms": base + 10_000,
+            "source": "kalshi",
+            "event_type": "trade",
+            "payload": {
+                "type": "trade",
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes_price_dollars": "0.40",
+                    "count_fp": "1000",
+                    "taker_book_side": "ask",
+                    "ts_ms": base + 10_000,
+                },
+            },
+        }
+    )
+    result = replay_rows(market, rows, latency_ms=150, maker_fee_multiplier=0.0)
+    assert all(fill.ts_ms < base + 9_000 for fill in result.fills)
+
+
 def test_replay_latency_delays_order_activation(tmp_path):
     path = tmp_path / "events.jsonl"
     _write_latency_fixture(path)
