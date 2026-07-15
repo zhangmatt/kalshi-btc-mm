@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -34,6 +36,9 @@ from .volatility import MultiHorizonVolatility
 
 MAX_CONSECUTIVE_EXECUTION_FAILURES = 10
 POSITION_DIVERGENCE_TOLERANCE = 1.0
+# This market's book updates hundreds of times per second; a multi-second
+# silent book on a live BRTI connection means the subscription died.
+BOOK_FROZEN_AFTER_MS = 5_000
 
 
 class PaperExecutor:
@@ -267,7 +272,15 @@ class LiveExecutor:
         if self.recorder:
             self.recorder.write(source="execution", event_type=event_type, payload={"errors": errors})
 
-    def execute(self, plan: KalshiQuotePlan, *, ticker: str, expiration_time: int) -> None:
+    def execute(self, plan: KalshiQuotePlan, *, ticker: str, expiration_time: int) -> list[RestingKalshiOrder]:
+        """Execute the plan; return orders created (parsed from the responses).
+
+        Re-reading GET /portfolio/orders immediately after a create is not
+        guaranteed read-your-writes consistent — a missing just-posted order
+        would be posted again on the next decision. The create responses are
+        the authoritative record of what now rests.
+        """
+        created: list[RestingKalshiOrder] = []
         if plan.cancel_ids:
             started_ms = time.time_ns() // 1_000_000
             responses = self.client.cancel_orders(list(plan.cancel_ids), subaccount=self.subaccount)
@@ -293,6 +306,23 @@ class LiveExecutor:
             errors = [row.get("error") for row in responses if row.get("error")]
             if errors:
                 self._record_order_errors("post_order_errors", errors)
+            for sent, row in zip(orders, responses):
+                inner = row.get("order") if isinstance(row.get("order"), dict) else row
+                if not isinstance(inner, dict):
+                    continue
+                order_id = inner.get("order_id")
+                if row.get("error") or not order_id:
+                    continue
+                created.append(
+                    RestingKalshiOrder(
+                        order_id=str(order_id),
+                        client_order_id=str(sent["client_order_id"]),
+                        side=str(sent["side"]),
+                        price=float(sent["price"]),
+                        remaining_count=float(sent["count"]),
+                    )
+                )
+        return created
 
     def resting(self, ticker: str) -> list[RestingKalshiOrder]:
         result = []
@@ -314,9 +344,20 @@ class LiveExecutor:
         return result
 
     def cancel_all(self, ticker: str) -> None:
-        orders = self.resting(ticker)
-        if orders:
-            self.client.cancel_orders([order.order_id for order in orders], subaccount=self.subaccount)
+        # The last safety action before exit: retry, because a single failed
+        # REST call here means unattended resting orders until GTD expiry.
+        last_error: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                orders = self.resting(ticker)
+                if orders:
+                    self.client.cancel_orders([order.order_id for order in orders], subaccount=self.subaccount)
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(1.0)
+        if last_error is not None:
+            raise last_error
 
 
 def _inventory(client: KalshiRestClient, ticker: str, subaccount: int) -> KalshiInventory:
@@ -401,10 +442,12 @@ def run_one(
     last_quote_summary: Optional[tuple[Any, ...]] = None
 
     def execute_plan(plan: KalshiQuotePlan) -> bool:
-        nonlocal consecutive_execution_failures
+        nonlocal consecutive_execution_failures, current_orders
         try:
-            executor.execute(plan, ticker=market.ticker, expiration_time=market.close_ts - 1)
-        except KalshiApiError as exc:
+            created = executor.execute(plan, ticker=market.ticker, expiration_time=market.close_ts - 1)
+        except (KalshiApiError, requests.RequestException) as exc:
+            # Network timeouts are as transient as API errors; neither may
+            # kill the loop before the consecutive-failure cap.
             consecutive_execution_failures += 1
             recorder.write(
                 source="execution",
@@ -416,6 +459,13 @@ def run_one(
             time.sleep(0.5)
             return False
         consecutive_execution_failures = 0
+        if live:
+            # Seed local order state from the create responses instead of an
+            # immediate REST re-read (not read-your-writes consistent; a
+            # missing just-posted order would be double-posted next decision).
+            cancelled = set(plan.cancel_ids)
+            current_orders = [order for order in current_orders if order.order_id not in cancelled]
+            current_orders.extend(created or [])
         return True
 
     print(
@@ -478,9 +528,18 @@ def run_one(
 
             bbo = book.snapshot()
             proxy = composite.snapshot(now_ms)
+            # A dead orderbook subscription on a connection kept alive by 1Hz
+            # BRTI leaves the book valid-but-frozen; stream liveness alone
+            # cannot detect it. Gate on the book's own last update.
+            book_age = now_ms - book.last_update_ms if book.last_update_ms else 10**9
+            book_frozen = bbo.valid and book_age > BOOK_FROZEN_AFTER_MS
             brti_age = now_ms - (brti_snapshot.source_ts_ms or 0)
             use_brti = brti_snapshot.value is not None and brti_age <= config.strategy.stale_after_ms
-            if use_brti:
+            if book_frozen:
+                spot = None
+                forecast = None
+                price_source = "book frozen"
+            elif use_brti:
                 spot = brti_snapshot.value
                 forecast = brti_vol.forecast()
                 price_source = "brti"
@@ -511,7 +570,8 @@ def run_one(
                             tuple(order.order_id for order in current_orders), (), "book divergence"
                         )
                         execute_plan(cancel)
-                        current_orders = executor.resting(market.ticker) if live else executor.resting()
+                        if not live:
+                            current_orders = executor.resting()
                     stream.reconnect()
                     ticker_watch.reset()
                     continue
@@ -520,7 +580,8 @@ def run_one(
                 if current_orders:
                     cancel = KalshiQuotePlan(tuple(order.order_id for order in current_orders), (), "pricing unavailable")
                     execute_plan(cancel)
-                    current_orders = executor.resting(market.ticker) if live else executor.resting()
+                    if not live:
+                        current_orders = executor.resting()
                 continue
 
             seconds_to_close = max(0.0, market.close_ts - now_s)
@@ -543,15 +604,20 @@ def run_one(
                 data_age_ms=data_age,
             )
             if decision.plan.changed:
-                # Rate-limit re-quotes; pure cancels always go through immediately.
+                # Rate-limit re-quotes; cancels always go through immediately —
+                # deferring a cancel bundled with a repost would leave the
+                # stale quote resting for the whole throttle window.
                 if decision.plan.post and now_s - last_execute_s < config.quote_throttle_s:
+                    if decision.plan.cancel_ids:
+                        execute_plan(KalshiQuotePlan(decision.plan.cancel_ids, (), "cancel before throttled repost"))
                     continue
                 if not execute_plan(decision.plan):
                     continue
                 last_execute_s = now_s
-                current_orders = executor.resting(market.ticker) if live else executor.resting()
-                if live:
-                    last_reconcile = now_s
+                if not live:
+                    current_orders = executor.resting()
+                # Live state was seeded from the create responses inside
+                # execute_plan; the periodic reconcile remains the authority.
                 summary = tuple((quote.side, quote.price, quote.count) for quote in decision.plan.post)
                 if summary != last_quote_summary or verbose:
                     print(

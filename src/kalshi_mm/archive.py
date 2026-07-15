@@ -101,6 +101,9 @@ def inspect_recording(path: Path) -> RecordingState:
     return RecordingState(closed=closed, finalized=finalized, readable=True)
 
 
+ORPHAN_AGE_S = 7_200.0
+
+
 def recording_is_ready(path: Path, config: ArchiveConfig, now: Optional[float] = None) -> bool:
     now = time.time() if now is None else now
     age = now - path.stat().st_mtime
@@ -110,9 +113,11 @@ def recording_is_ready(path: Path, config: ArchiveConfig, now: Optional[float] =
     if not state.readable:
         return False
     # Runner recordings never contain market_status_at_close; the collector's
-    # events_* files must, or they are still being written.
+    # events_* files must, or they are still being written. Crash-orphaned
+    # partials (no close marker, hours old) would otherwise be stranded
+    # forever: never archived, never eligible for retention, filling the disk.
     if path.name.startswith("events_") and not state.closed:
-        return False
+        return age >= ORPHAN_AGE_S
     return state.finalized or age >= config.settlement_grace_s
 
 

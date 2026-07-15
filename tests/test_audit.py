@@ -29,9 +29,14 @@ def test_audit_accepts_complete_research_recording(tmp_path):
     result = audit(path, now_ms=201_000)
     assert result.healthy
     assert result.status == "complete"
-    stale = audit(path, now_ms=321_001, require_live=True)
+    # Beyond the 300s gap tolerance a complete-and-old newest file must fail.
+    stale = audit(path, now_ms=501_000, require_live=True)
     assert not stale.healthy
     assert any("no active recording" in value for value in stale.errors)
+    # Within the gap tolerance it must NOT fail for that reason (restart storm
+    # guard); other liveness errors may still apply.
+    gap = audit(path, now_ms=321_001, require_live=True)
+    assert not any("no active recording" in value for value in gap.errors)
 
 
 def test_audit_requires_configured_external_depth(tmp_path):

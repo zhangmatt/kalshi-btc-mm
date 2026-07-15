@@ -16,6 +16,7 @@ RestartSteps=8
 RestartMaxDelaySec=300
 KillSignal=SIGINT
 TimeoutStopSec=30
+OOMScoreAdjust=-500
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

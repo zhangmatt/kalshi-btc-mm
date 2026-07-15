@@ -267,8 +267,14 @@ def collect_one(
             status_event = "market_status_at_close" if time.time() >= market.close_ts else "market_status_on_exit"
             recorder.write(source="system", event_type=status_event, payload=_market_payload(final_market))
         except Exception as exc:
-            recorder.write(source="system", event_type="market_status_error", payload={"error": str(exc)})
-        recorder.close()
+            # A dead recorder raises here too; never let that mask the
+            # original error or skip close().
+            try:
+                recorder.write(source="system", event_type="market_status_error", payload={"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            recorder.close()
     if deadline >= market.close_ts:
         schedule_result_finalizer(
             rest_url=config.rest_url,

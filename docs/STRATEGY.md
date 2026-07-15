@@ -237,6 +237,21 @@ fill rate (calibrates queue model), real toxicity labels (retrains Model T).
   all prior zero-fee results invalidated.
 - **2026-07-14** — 150ms latency became the replay default; zero-latency results
   invalidated for promotion purposes.
+- **2026-07-15 (full-system audit)** — Three independent deep reviews (research
+  stack, simulation/strategy, collector/ops) + verification. 14 confirmed defects
+  fixed in v0.3.2/v0.3.3, headline items: replay granted impossible fills (posts
+  crossed-in-flight accepted; no safety cancels during invalid-book/stale-BRTI;
+  unbounded markout horizons across gaps); fill-feature join leaked the causal
+  trade; strategy silently shadowed duplicate same-side orders (live position-cap
+  escape); taper-boundary tick math; health/recover chain restart-stormed a healthy
+  collector during gaps and young windows (now: completeness grace, per-source
+  liveness, freshness-guarded recover); WS backoff hot-loop on outages; runtime WS
+  errors were fatal; crash-orphaned recordings could never archive or be deleted;
+  non-atomic parquet writes; A/B markout pairing dropped zero-fill windows (in
+  dollars now). All fee-era labels/fits/A-B results regenerated under corrected
+  simulation. Deferred (logged): runner single-thread REST stalls, recorder
+  close race, per-window feed cold restarts, read-consistency beyond response
+  seeding, EWMA per-sample decay.
 - **2026-07-15 (model audit)** — Four defects found and fixed before they could bias
   results: (1) train/val/holdout split ordered by ticker string, which scrambles
   across month boundaries (AUG<JUL alphabetically) — now ordered by data timestamp;

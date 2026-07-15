@@ -3,4 +3,16 @@ Description=Restart the Kalshi collector after a failed data audit
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl restart kalshi-collector.service
+# Restart only when the collector is actually wedged: inactive, or its newest
+# recording untouched for >180s. During market gaps and Kalshi outages the
+# collector legitimately waits (while still appending reference data); blind
+# restarts on every audit cycle shred windows and kill result-finalizer threads.
+ExecStart=/bin/bash -c '\
+  newest=$(ls -t /home/ubuntu/kalshi_btc_mm/data/kalshi/*/events_*.jsonl.gz 2>/dev/null | head -1); \
+  if ! systemctl is-active --quiet kalshi-collector; then \
+    systemctl restart kalshi-collector; \
+  elif [ -n "$newest" ] && [ $(( $(date +%s) - $(stat -c %Y "$newest") )) -gt 180 ]; then \
+    systemctl restart kalshi-collector; \
+  else \
+    echo "audit FAIL but collector active and data fresh; not restarting"; \
+  fi'

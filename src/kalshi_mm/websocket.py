@@ -44,6 +44,7 @@ class KalshiWebSocket:
         self.last_message_ms = 0
         self.fatal_error: Optional[str] = None
         self._connected_at_ms = 0
+        self._last_snapshot_request_ms = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -132,7 +133,13 @@ class KalshiWebSocket:
         self.last_message_ms = receive_ts_ms
         msg = envelope.get("msg") or {}
         if envelope.get("type") == "error":
-            self.fatal_error = f"websocket subscription failed: {msg}"
+            # Only errors during initial subscription are fatal; a rejected
+            # runtime command (e.g. a get_snapshot for a stale sid) must not
+            # kill the whole collector mid-window.
+            if receive_ts_ms - self._connected_at_ms <= 10_000:
+                self.fatal_error = f"websocket subscription failed: {msg}"
+            else:
+                self._record_status("command_error", error=str(msg))
         exchange_ts_ms = msg.get("ts_ms") or msg.get("received_at")
         if self.recorder:
             self.recorder.write(
@@ -144,7 +151,15 @@ class KalshiWebSocket:
             )
         previous_sequence = self.order_book.sequence
         updated = self.order_book.apply(envelope, use_yes_price=True)
-        if envelope.get("type") == "orderbook_delta" and not updated and not self.order_book.snapshot().valid:
+        if (
+            envelope.get("type") == "orderbook_delta"
+            and not updated
+            and not self.order_book.snapshot().valid
+            # One snapshot request per second: every buffered delta after a gap
+            # would otherwise fire its own get_snapshot, flooding the socket.
+            and receive_ts_ms - self._last_snapshot_request_ms >= 1_000
+        ):
+            self._last_snapshot_request_ms = receive_ts_ms
             if self.recorder:
                 self.recorder.write(
                     source="system",
@@ -207,6 +222,11 @@ class KalshiWebSocket:
     def _run(self) -> None:
         backoff = 0.25
         while not self._stop.is_set():
+            # Zeroed before each attempt so backoff only resets when THIS
+            # connection survived >=5s. Comparing against the last successful
+            # open ever would reset backoff on every retry during an outage,
+            # producing a hot reconnect loop.
+            self._connected_at_ms = 0
             headers = self.signer.headers("GET", "/trade-api/ws/v2")
             self._ws = websocket.WebSocketApp(
                 self.ws_url,

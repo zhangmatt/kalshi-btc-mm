@@ -20,6 +20,9 @@ REQUIRED_CHANNELS = {
 }
 REFERENCE_VENUES = {"binance", "coinbase", "kraken"}
 CONTEXT_EVENTS = {"market_metadata", "series_metadata", "series_fee_changes", "market_incentives"}
+# Completeness (missing channel/venue/context) is only an error once the
+# recording is old enough for every feed to have plausibly delivered.
+COMPLETENESS_GRACE_MS = 90_000
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,8 @@ def _scan(path: Path) -> dict[str, Any]:
         "channel_seq": {},
         "channel_seq_gaps": Counter(),
         "external_status": Counter(),
+        "source_last_ts": {},
+        "brti_last_ts": None,
     }
     try:
         with opener(path, "rt", encoding="utf-8") as handle:
@@ -97,6 +102,13 @@ def _scan(path: Path) -> dict[str, Any]:
                             state["first_ts"] = receive_ts
                         if state["last_ts"] is None or receive_ts > state["last_ts"]:
                             state["last_ts"] = receive_ts
+                        previous_source_ts = state["source_last_ts"].get(source)
+                        if previous_source_ts is None or receive_ts > previous_source_ts:
+                            state["source_last_ts"][source] = receive_ts
+                        if event_type == "cfbenchmarks_value" and (
+                            state["brti_last_ts"] is None or receive_ts > state["brti_last_ts"]
+                        ):
+                            state["brti_last_ts"] = receive_ts
                     if source == "kalshi" and event_type == "subscribed":
                         channel = str((row.get("payload") or {}).get("msg", {}).get("channel"))
                         if channel != "None":
@@ -166,25 +178,50 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
     venues = scan["venues"]
     depth_venues = scan["depth_venues"]
     context = scan["context"]
+    # Completeness checks only make sense once feeds have had time to deliver:
+    # a seconds-old recording legitimately lacks external data or (in a quiet
+    # market) any order-book delta. Failing a young file would trip OnFailure
+    # recovery and restart a healthy collector — every minute (restart storm).
+    recording_age_ms = now_ms - first_ts
+    mature = recording_age_ms > COMPLETENESS_GRACE_MS
     missing_channels = sorted(REQUIRED_CHANNELS - channels)
     missing_venues = sorted(REFERENCE_VENUES - venues)
     missing_context = sorted(CONTEXT_EVENTS - context)
+    completeness = errors if mature else warnings
     if missing_channels:
-        errors.append(f"missing websocket subscriptions: {', '.join(missing_channels)}")
+        completeness.append(f"missing websocket subscriptions: {', '.join(missing_channels)}")
     if missing_venues:
-        errors.append(f"missing reference venue data: {', '.join(missing_venues)}")
+        completeness.append(f"missing reference venue data: {', '.join(missing_venues)}")
     collector_config = scan["collector_config"]
     if collector_config.get("external_depth_enabled"):
         expected_depth = set(collector_config.get("external_depth_venues") or REFERENCE_VENUES)
         missing_depth = sorted(expected_depth - depth_venues)
         if missing_depth:
-            errors.append(f"missing external L2 data: {', '.join(missing_depth)}")
+            completeness.append(f"missing external L2 data: {', '.join(missing_depth)}")
     if missing_context:
-        errors.append(f"missing market context: {', '.join(missing_context)}")
+        completeness.append(f"missing market context: {', '.join(missing_context)}")
     if counts["orderbook_snapshot"] < 1 or counts["orderbook_delta"] < 1:
-        errors.append("missing usable L2 order-book snapshot/deltas")
+        completeness.append("missing usable L2 order-book snapshot/deltas")
     if counts["cfbenchmarks_value"] < 1:
-        errors.append("missing BRTI settlement feed")
+        completeness.append("missing BRTI settlement feed")
+
+    # A feed that dies mid-window must not PASS just because it appeared once:
+    # per-source recency is the difference between "was subscribed" and "alive".
+    # Ops-only (require_live): research audits of historical fragments would
+    # trip on legitimately sparse files.
+    if require_live:
+        source_last: dict[str, int] = scan["source_last_ts"]
+        reference_ms = min(now_ms, close_ms) if close_ms is not None else now_ms
+        kalshi_last = source_last.get("kalshi")
+        if kalshi_last is not None and reference_ms - kalshi_last > 60_000:
+            errors.append(f"kalshi feed silent for {(reference_ms - kalshi_last) / 1_000:.0f}s within the window")
+        brti_last = scan["brti_last_ts"]
+        if brti_last is not None and reference_ms - brti_last > 120_000:
+            errors.append(f"BRTI silent for {(reference_ms - brti_last) / 1_000:.0f}s within the window")
+        for venue in sorted(REFERENCE_VENUES):
+            venue_last = source_last.get(venue)
+            if venue_last is not None and reference_ms - venue_last > 300_000:
+                warnings.append(f"{venue} feed silent for {(reference_ms - venue_last) / 1_000:.0f}s")
 
     sequence_gaps = counts["orderbook_sequence_gap"]
     if sequence_gaps:
@@ -205,7 +242,7 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
             warnings.append(f"recording began {start_offset:.1f}s after market open")
         if end_offset is not None and end_offset < -2:
             errors.append(f"recording ended {-end_offset:.1f}s before market close")
-        if require_live and close_ms is not None and now_ms - close_ms > 120_000:
+        if require_live and close_ms is not None and now_ms - close_ms > 300_000:
             errors.append(f"no active recording found {(now_ms - close_ms) / 1_000:.1f}s after market close")
     elif close_ms is not None and (now_ms < close_ms + 2_000 or (require_live and now_ms < close_ms + 120_000)):
         status = "in_progress"
@@ -213,14 +250,17 @@ def audit(path: str | Path, *, now_ms: Optional[int] = None, require_live: bool 
             errors.append(f"active recording is stale by {(now_ms - last_ts) / 1_000:.1f}s")
     else:
         status = "partial"
-        if require_live:
-            # A live collector always either has an in-progress recording or a
-            # freshly closed one. A stale close-marker-less file as the newest
-            # recording means collection stopped; this must never PASS.
+        if require_live and now_ms - last_ts > 120_000:
+            # A live collector always has either an in-progress recording or a
+            # freshly-written one (it appends reference/BRTI data to the old
+            # file while holding feeds across the between-market gap). A stale
+            # close-marker-less newest file means collection stopped.
             errors.append(
                 "collector appears dead: newest recording has no close marker and "
                 f"its last event is {(now_ms - last_ts) / 1_000:.1f}s old"
             )
+        elif require_live:
+            warnings.append("between-market gap: no close marker but data is fresh")
         else:
             warnings.append("recording has no close marker")
 

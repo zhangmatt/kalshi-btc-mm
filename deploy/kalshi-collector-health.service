@@ -5,6 +5,8 @@ OnFailure=kalshi-collector-recover.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=300
+Nice=10
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/kalshi_btc_mm
