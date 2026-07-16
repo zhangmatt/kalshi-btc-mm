@@ -40,3 +40,17 @@ decision cadence. Train 74 / val 25 / holdout 25 (locked, untouched).
 - Variants: baseline, micro25, **micro25+toxgate combined**, toxgate with tuned
   scale ∈ {1¢, 2¢, 4¢}, modelv at w ∈ {0.25, 0.5}.
 - Same splits; holdout stays locked until a promotion decision.
+
+## Addendum (same day): combo25 = micro25 + toxgate composed, same 25 val windows
+
+| variant | fills/w | markout/contract | settle P&L/w | Δmarkout$ (CI) | Δsettle (CI) |
+|---|---|---|---|---|---|
+| combo25 | 148.6 | −0.08¢ | **+$0.19** | +$0.36 [−0.64, +1.39] | +$0.30 [−0.37, +0.99] |
+
+Read: best ABSOLUTE settlement P&L of any variant (+$0.19/w vs baseline −$0.11)
+and positive point estimates on both diffs — but neither CI excludes zero, and
+the effects are clearly SUB-additive (+0.36 vs the singles' +0.49 and +0.27):
+the microprice lean and the gate partially defend against the same fills, and
+the gate's abstention windows add variance. micro25 alone remains the only
+statistically significant variant. Friday: micro25 vs combo at tuned gate
+scales (1¢/2¢/4¢) on ≥300 windows decides the graduation candidate.
