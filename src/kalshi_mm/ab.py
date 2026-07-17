@@ -202,13 +202,18 @@ def build_variants(
             close_probe.name = name
             close_probe.strategy_overrides = {"stop_quote_before_close_s": float(int(name[5:]))}
             variants.append(close_probe)
-        elif name == "modelv":
+        elif name.startswith("modelv"):
+            # modelv = full weight (known-failed config, kept for reference);
+            # modelvNN = prediction shrunk to NN% before centering.
             if not model_v_path or not Path(model_v_path).exists():
                 raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
             # Use the book-feature-set bucket models (ext-set models require
             # externals to be fresh; book models degrade more gracefully).
             models = [m for m in load_models(model_v_path) if m.meta.get("feature_set") == "book"]
-            variants.append(ModelVSkew(models))
+            weight = int(name[6:]) / 100.0 if len(name) > 6 else 1.0
+            variant = ModelVSkew(models, weight=weight)
+            variant.name = name
+            variants.append(variant)
         else:
             raise SystemExit(f"unknown variant: {name}")
     return variants
