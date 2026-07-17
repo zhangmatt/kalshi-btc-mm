@@ -171,10 +171,13 @@ class QuoteAdjuster:
     """Pluggable quoting variant: adjust fair value and per-side toxicity.
 
     The baseline (identity) adjuster reproduces plain settlement-model quoting.
-    Variants used by the A/B harness subclass or configure this.
+    Variants used by the A/B harness subclass or configure this. A variant may
+    also carry strategy_overrides (e.g. min_edge_dollars,
+    stop_quote_before_close_s) that the A/B harness threads into its replay.
     """
 
     name = "baseline"
+    strategy_overrides: dict = {}
 
     def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
         return ctx.fair_yes, 0.0, 0.0
@@ -227,6 +230,7 @@ def replay_rows(
     min_edge_dollars: float = 0.01,
     latency_ms: int = 150,
     maker_fee_multiplier: float = 0.0,
+    stop_quote_before_close_s: float = 90.0,
     prewarm_ticks: list[tuple[int, float]] = [],
     adjuster: Optional[QuoteAdjuster] = None,
 ) -> ReplayResult:
@@ -250,6 +254,7 @@ def replay_rows(
         config=KalshiStrategyConfig(
             min_edge_dollars=min_edge_dollars,
             maker_fee_multiplier=maker_fee_multiplier,
+            stop_quote_before_close_s=stop_quote_before_close_s,
         ),
     )
     trade_flow: deque[tuple[int, float]] = deque()

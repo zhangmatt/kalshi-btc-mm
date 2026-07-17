@@ -88,6 +88,27 @@ def test_build_variants_parses_spec(tmp_path):
     assert [v.name for v in variants] == ["baseline", "micro25", "micro50"]
     with pytest.raises(SystemExit):
         build_variants("combo25", None)
+
+
+def test_sweep_variant_specs_parse_scales_and_overrides(tmp_path):
+    from kalshi_mm.ab import ComposedAdjuster, build_variants
+    from kalshi_mm.models import T_MIRRORED_FEATURES, save_models
+
+    rng = np.random.default_rng(3)
+    model = fit_logistic(
+        rng.normal(size=(300, len(T_MIRRORED_FEATURES))),
+        (rng.uniform(size=300) > 0.6).astype(float),
+        features=T_MIRRORED_FEATURES,
+        bucket=(300.0, 600.0),
+    )
+    path = tmp_path / "t.json"
+    save_models([model], path)
+    combo1, wide2, close30 = build_variants("combo25x1,wide2,close30", str(path))
+    assert isinstance(combo1, ComposedAdjuster)
+    assert combo1.parts[1].scale_dollars == 0.01  # x1 = 1-cent gate scale
+    assert combo1.parts[0].weight == 0.25
+    assert wide2.strategy_overrides == {"min_edge_dollars": 0.02}
+    assert close30.strategy_overrides == {"stop_quote_before_close_s": 30.0}
     with pytest.raises(SystemExit):
         build_variants("toxgate", str(tmp_path / "missing.json"))
     with pytest.raises(SystemExit):

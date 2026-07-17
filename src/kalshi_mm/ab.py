@@ -167,15 +167,41 @@ def build_variants(
                 raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
             variants.append(ToxicityGate(load_models(model_t_path)))
         elif name.startswith("combo"):
-            # comboNN = microprice skew at NN% + toxicity gate, composed.
+            # comboNN = micro skew NN% + toxicity gate (default 2c scale);
+            # comboNNxM = same with an M-cent gate scale (e.g. combo25x1).
             if not model_t_path or not Path(model_t_path).exists():
                 raise SystemExit("combo variant requires --model-t pointing at a model_t json")
-            weight = int(name[5:]) / 100.0
+            spec_body = name[5:]
+            if "x" in spec_body:
+                weight_part, scale_part = spec_body.split("x", 1)
+                scale = int(scale_part) / 100.0
+            else:
+                weight_part, scale = spec_body, 0.02
             variants.append(
                 ComposedAdjuster(
-                    [MicropriceSkew(weight), ToxicityGate(load_models(model_t_path))], name
+                    [
+                        MicropriceSkew(int(weight_part) / 100.0),
+                        ToxicityGate(load_models(model_t_path), scale_dollars=scale),
+                    ],
+                    name,
                 )
             )
+        elif name.startswith("wide"):
+            # wideN = plain baseline quoting with an N-cent minimum edge:
+            # probes the capture-vs-selection curve.
+            widened = QuoteAdjuster()
+            widened.name = name
+            widened.strategy_overrides = {"min_edge_dollars": int(name[4:]) / 100.0}
+            variants.append(widened)
+        elif name.startswith("close"):
+            # closeN = baseline quoting continued into the final minutes down
+            # to an N-second cutoff, where the settlement-averaging model is
+            # most differentiated. Exploratory: separate hypothesis, distinct
+            # risk profile; never a graduation candidate from screening alone.
+            close_probe = QuoteAdjuster()
+            close_probe.name = name
+            close_probe.strategy_overrides = {"stop_quote_before_close_s": float(int(name[5:]))}
+            variants.append(close_probe)
         elif name == "modelv":
             if not model_v_path or not Path(model_v_path).exists():
                 raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
@@ -225,12 +251,15 @@ def run_ab(
         window = _load_window(market, paths)
         rows = list(window.rows)
         for variant in variants:
+            overrides = getattr(variant, "strategy_overrides", {}) or {}
             result: ReplayResult = replay_rows(
                 market,
                 rows,
                 latency_ms=latency_ms,
                 maker_fee_multiplier=maker_fee_multiplier,
-                adjuster=variant if variant.name != "baseline" else None,
+                min_edge_dollars=overrides.get("min_edge_dollars", 0.01),
+                stop_quote_before_close_s=overrides.get("stop_quote_before_close_s", 90.0),
+                adjuster=variant if type(variant) is not QuoteAdjuster else None,
             )
             outcomes.append(
                 WindowOutcome(
