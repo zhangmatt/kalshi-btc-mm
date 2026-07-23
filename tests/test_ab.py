@@ -103,12 +103,16 @@ def test_sweep_variant_specs_parse_scales_and_overrides(tmp_path):
     )
     path = tmp_path / "t.json"
     save_models([model], path)
-    combo1, wide2, close30 = build_variants("combo25x1,wide2,close30", str(path))
+    combo1, wide2, close30, tox4 = build_variants("combo25x1,wide2,close30,toxgate4", str(path))
     assert isinstance(combo1, ComposedAdjuster)
     assert combo1.parts[1].scale_dollars == 0.01  # x1 = 1-cent gate scale
     assert combo1.parts[0].weight == 0.25
     assert wide2.strategy_overrides == {"min_edge_dollars": 0.02}
     assert close30.strategy_overrides == {"stop_quote_before_close_s": 30.0}
+    # Gate-only variant with a cent-scale suffix, no microprice component.
+    assert tox4.name == "toxgate4" and tox4.scale_dollars == 0.04
+    from kalshi_mm.ab import ToxicityGate
+    assert isinstance(tox4, ToxicityGate)
     with pytest.raises(SystemExit):
         build_variants("toxgate", str(tmp_path / "missing.json"))
     with pytest.raises(SystemExit):

@@ -162,10 +162,16 @@ def build_variants(
             variants.append(QuoteAdjuster())
         elif name.startswith("micro"):
             variants.append(MicropriceSkew(int(name[5:]) / 100.0))
-        elif name == "toxgate":
+        elif name.startswith("toxgate"):
+            # toxgate = gate only, default 2c scale; toxgateN = N-cent scale.
+            # Isolates the toxicity gate from any microprice skew.
             if not model_t_path or not Path(model_t_path).exists():
                 raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
-            variants.append(ToxicityGate(load_models(model_t_path)))
+            suffix = name[7:]
+            scale = int(suffix) / 100.0 if suffix else 0.02
+            gate = ToxicityGate(load_models(model_t_path), scale_dollars=scale)
+            gate.name = name
+            variants.append(gate)
         elif name.startswith("combo"):
             # comboNN = micro skew NN% + toxicity gate (default 2c scale);
             # comboNNxM = same with an M-cent gate scale (e.g. combo25x1).

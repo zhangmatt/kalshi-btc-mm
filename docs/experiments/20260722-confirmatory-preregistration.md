@@ -34,3 +34,16 @@ than the toxic fills it avoids.)
 Val windows overlap earlier looks (train/holdout do not). Single BTC market,
 ~10 days of regimes. State-trained Model T; fills-trained deferred. Simulated
 queue — live pilot remains mandatory after any promotion regardless of holdout.
+
+## Amendment (2026-07-23, before the run): isolate the gate
+
+micro25 did not replicate, so `combo` cannot attribute its edge to the gate vs
+the micro skew. Revised variant set isolates the gate:
+
+baseline, toxgate2, toxgate4, toxgate6, toxgate8 (GATE-ONLY scale ladder =
+primary hypothesis, cleanly isolated), combo25x4, combo25x6 (micro+gate at the
+two best scales, to measure micro's MARGINAL contribution on top of the gate).
+
+Added attribution rule: if toxgate4 ~ combo25x4 (overlapping CIs), the micro
+skew is dropped as dead weight (simpler = more robust live). If combo > toxgate
+materially, the interaction is kept. Promotion/holdout rules unchanged.
