@@ -80,6 +80,29 @@ def test_chronological_split_preserves_given_order():
     assert chronological_split(["b", "a", "b", "c", "d", "e"])[0] == ["b", "a", "c"]
 
 
+def test_columnar_feature_store_orders_filters_and_fills_missing(tmp_path):
+    import numpy as np
+
+    pytest.importorskip("pyarrow")
+    from kalshi_mm.features import write_parquet
+    from kalshi_mm.fit import load_feature_store, window_order
+
+    for i, ticker in enumerate(["KXBTC15M-A", "KXBTC15M-B", "KXBTC15M-C"]):
+        rows = [{"ticker": ticker, "ts_ms": i * 1_000_000 + j, "imb_top1": float(j)} for j in range(20)]
+        write_parquet(rows, tmp_path / f"{ticker}.parquet")
+    pattern = str(tmp_path / "*.parquet")
+    # Chronological order by first ts (NOT ticker string).
+    assert [t for t, _ in window_order(pattern)] == ["KXBTC15M-A", "KXBTC15M-B", "KXBTC15M-C"]
+    # Ticker filter skips the holdout window entirely.
+    store = load_feature_store(pattern, tickers={"KXBTC15M-A", "KXBTC15M-B"})
+    assert set(store) == {"KXBTC15M-A", "KXBTC15M-B"}
+    # Columns are unboxed float64 arrays; a present column round-trips.
+    assert store["KXBTC15M-A"]["imb_top1"].dtype == np.float64
+    assert np.array_equal(store["KXBTC15M-A"]["imb_top1"], np.arange(20.0))
+    # A column absent from the parquet is filled with NaN, not dropped.
+    assert np.isnan(store["KXBTC15M-A"]["ext_imbalance"]).all()
+
+
 def test_block_bootstrap_ci_covers_mean():
     values = [1.0, 2.0, 3.0, 4.0, 5.0] * 10
     mean, low, high = block_bootstrap_ci(values)
