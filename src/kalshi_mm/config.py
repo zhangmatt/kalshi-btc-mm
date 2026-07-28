@@ -29,6 +29,8 @@ class KalshiRuntimeConfig:
     position_poll_s: float = 1.0
     order_reconcile_s: float = 1.0
     quote_throttle_s: float = 0.25
+    toxicity_model_path: str = ""
+    toxicity_scale_dollars: float = 0.06
     allow_proxy_pricing: bool = False
     ws_insecure: bool = False
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
@@ -80,6 +82,8 @@ class KalshiRuntimeConfig:
             position_poll_s=float(env.get("KALSHI_POSITION_POLL_S", "1.0")),
             order_reconcile_s=float(env.get("KALSHI_ORDER_RECONCILE_S", "1.0")),
             quote_throttle_s=float(env.get("KALSHI_QUOTE_THROTTLE_S", "0.25")),
+            toxicity_model_path=env.get("KALSHI_TOXICITY_MODEL", ""),
+            toxicity_scale_dollars=float(env.get("KALSHI_TOXICITY_SCALE", "0.06")),
             allow_proxy_pricing=_bool(env, "KALSHI_ALLOW_PROXY_PRICING", False),
             ws_insecure=_bool(env, "KALSHI_WS_INSECURE", _bool(env, "WS_INSECURE", False)),
             binance_ws_url=binance_ws_url,

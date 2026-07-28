@@ -30,6 +30,7 @@ from .strategy import (
 from .websocket import KalshiWebSocket
 from .recorder import EventRecorder
 from .replay import ConservativeQueueSimulator
+from .live_gate import LiveToxicityGate
 from .feeds import CompositeReference, reference_streams
 from .fair_value import kalshi_btc15m_fair_value
 from .volatility import MultiHorizonVolatility
@@ -409,6 +410,17 @@ def run_one(
     )
     fill_tracker = FillTracker(market.ticker) if live else None
     ticker_watch = TickerWatch(market.ticker)
+    toxicity_gate: Optional[LiveToxicityGate] = None
+    if config.toxicity_model_path:
+        toxicity_gate = LiveToxicityGate(
+            config.toxicity_model_path,
+            scale_dollars=config.toxicity_scale_dollars,
+        )
+        print(
+            f"[kalshi] toxicity gate ENABLED model={config.toxicity_model_path} "
+            f"scale={config.toxicity_scale_dollars}",
+            flush=True,
+        )
 
     def on_ws_event(envelope: Mapping[str, Any]) -> None:
         ticker_watch.on_envelope(envelope)
@@ -416,6 +428,14 @@ def run_one(
             fill_tracker.on_envelope(envelope)
         if not live:
             executor.on_trade_envelope(envelope, market.ticker)
+        if toxicity_gate is not None and envelope.get("type") == "trade":
+            msg = envelope.get("msg") or {}
+            if msg.get("market_ticker") == market.ticker:
+                count_raw = msg.get("count_fp") or msg.get("count")
+                taker = msg.get("taker_book_side") or msg.get("book_side")
+                if count_raw is not None and taker in {"bid", "ask"}:
+                    ts = int(msg.get("ts_ms") or time.time_ns() // 1_000_000)
+                    toxicity_gate.on_trade(ts, str(taker), float(count_raw))
 
     stream = KalshiWebSocket(
         signer=signer,
@@ -594,6 +614,15 @@ def run_one(
             )
             if not live:
                 executor.last_fair_yes = fair.yes
+            bid_tox = ask_tox = 0.0
+            if toxicity_gate is not None and bbo.valid and bbo.bid is not None and bbo.ask is not None:
+                bid_tox, ask_tox = toxicity_gate.toxicity_dollars(
+                    now_ms=now_ms,
+                    book=book,
+                    bbo=bbo,
+                    fair_yes=fair.yes,
+                    seconds_to_close=seconds_to_close,
+                )
             data_age = now_ms - stream.last_message_ms if stream.last_message_ms else 10**9
             decision = strategy.decide(
                 fair_yes=fair.yes,
@@ -602,6 +631,8 @@ def run_one(
                 current_orders=current_orders,
                 seconds_to_close=seconds_to_close,
                 data_age_ms=data_age,
+                bid_toxicity_dollars=bid_tox,
+                ask_toxicity_dollars=ask_tox,
             )
             if decision.plan.changed:
                 # Rate-limit re-quotes; cancels always go through immediately —

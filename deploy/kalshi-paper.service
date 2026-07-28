@@ -1,0 +1,31 @@
+[Unit]
+Description=Kalshi BTC 15m PAPER maker (toxgate6 gate, simulated fills, NO real orders)
+Wants=network-online.target
+After=network-online.target kalshi-collector.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kalshi_btc_mm
+EnvironmentFile=/home/ubuntu/.config/kalshi/collector.env
+# Paper only: runner without --live never places an order. The gate uses the
+# confirmatory-fit Model T at the validated 6c scale.
+Environment=KALSHI_TOXICITY_MODEL=/home/ubuntu/kalshi_btc_mm/data/models/model_t_state.json
+Environment=KALSHI_TOXICITY_SCALE=0.06
+ExecStart=/home/ubuntu/kalshi_btc_mm/.venv/bin/python -m kalshi_mm.runner --windows 0
+Restart=always
+RestartSec=10
+RestartSteps=8
+RestartMaxDelaySec=300
+KillSignal=SIGINT
+TimeoutStopSec=30
+OOMScoreAdjust=-200
+MemoryMax=512M
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
