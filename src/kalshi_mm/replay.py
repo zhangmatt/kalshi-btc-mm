@@ -165,6 +165,7 @@ class QuoteContext:
     ask_size_delta: float = 0.0
     ext_micro_lead_bps: Optional[float] = None
     ext_imbalance: Optional[float] = None
+    sigma_per_s: float = 0.0
 
 
 class QuoteAdjuster:
@@ -386,6 +387,7 @@ def replay_rows(
                         ask_size_delta=bbo.ask_size - prev_ask_size if prev_ask_size is not None else 0.0,
                         ext_micro_lead_bps=sorted(micro_leads)[len(micro_leads) // 2] if micro_leads else None,
                         ext_imbalance=sorted(ext_imbs)[len(ext_imbs) // 2] if ext_imbs else None,
+                        sigma_per_s=forecast.sigma_per_s,
                     )
                     # Deltas sample on the feature store's cadence so training
                     # and consumption see the same timescale.

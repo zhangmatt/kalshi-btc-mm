@@ -90,6 +90,37 @@ def test_build_variants_parses_spec(tmp_path):
         build_variants("combo25", None)
 
 
+def test_external_lead_skew_shifts_fair_toward_the_lead(tmp_path):
+    from dataclasses import replace
+    from kalshi_mm.ab import ExternalLeadSkew
+
+    ctx = _context()
+    ctx = replace(ctx, seconds_to_close=400.0, sigma_per_s=2e-4, fair_yes=0.50, ext_micro_lead_bps=5.0)
+    up, _, _ = ExternalLeadSkew(1.0).adjust(ctx)
+    assert up > 0.50  # external leads BRTI upward -> raise P(yes)
+    down, _, _ = ExternalLeadSkew(1.0).adjust(replace(ctx, ext_micro_lead_bps=-5.0))
+    assert down < 0.50
+    # No external signal -> no change.
+    assert ExternalLeadSkew(1.0).adjust(replace(ctx, ext_micro_lead_bps=None))[0] == 0.50
+
+
+def test_plus_composes_variants(tmp_path):
+    from kalshi_mm.ab import ComposedAdjuster, build_variants
+    from kalshi_mm.models import T_MIRRORED_FEATURES, save_models
+
+    rng = np.random.default_rng(4)
+    model = fit_logistic(
+        rng.normal(size=(300, len(T_MIRRORED_FEATURES))),
+        (rng.uniform(size=300) > 0.6).astype(float),
+        features=T_MIRRORED_FEATURES, bucket=(300.0, 600.0),
+    )
+    path = tmp_path / "t.json"
+    save_models([model], path)
+    (composed,) = build_variants("extlead50+toxgate6", str(path))
+    assert isinstance(composed, ComposedAdjuster)
+    assert [type(p).__name__ for p in composed.parts] == ["ExternalLeadSkew", "ToxicityGate"]
+
+
 def test_sweep_variant_specs_parse_scales_and_overrides(tmp_path):
     from kalshi_mm.ab import ComposedAdjuster, build_variants
     from kalshi_mm.models import T_MIRRORED_FEATURES, save_models

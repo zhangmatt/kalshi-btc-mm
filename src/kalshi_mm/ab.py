@@ -9,13 +9,42 @@ net markout-given-fill without collapsing fill count.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from .features import _load_window, _window_is_final, group_recordings_by_market
+from .gbm import clamp, gaussian_cdf, inv_gaussian_cdf
 from .models import LinearModel, block_bootstrap_ci, load_models, mirror_features
 from .replay import QuoteAdjuster, QuoteContext, ReplayResult, replay_rows
+
+
+class ExternalLeadSkew(QuoteAdjuster):
+    """LinkedIn-style fair value: lead BRTI with the external composite.
+
+    BRTI settles from a 1Hz average of constituent exchanges, so it lags
+    tick-level external spot. When the external microprice leads BRTI by
+    `ext_micro_lead_bps`, shift the binary's fair toward where BRTI is heading,
+    via the GBM: dz = (weight * lead_fraction) / (sigma * sqrt(T)). This is the
+    maker's primary defense against snipers trading exactly that lead against a
+    stale quote.
+    """
+
+    def __init__(self, weight: float):
+        self.weight = weight
+        self.name = f"extlead{int(weight * 100):02d}"
+
+    def adjust(self, ctx: QuoteContext) -> tuple[float, float, float]:
+        lead_bps = ctx.ext_micro_lead_bps
+        if lead_bps is None or ctx.sigma_per_s <= 0 or ctx.seconds_to_close <= 0:
+            return ctx.fair_yes, 0.0, 0.0
+        denom = ctx.sigma_per_s * math.sqrt(ctx.seconds_to_close)
+        if denom <= 0:
+            return ctx.fair_yes, 0.0, 0.0
+        frac = self.weight * lead_bps / 10_000.0  # implied fractional spot move
+        z = inv_gaussian_cdf(clamp(ctx.fair_yes, 0.01, 0.99)) + frac / denom
+        return clamp(gaussian_cdf(z), 0.001, 0.999), 0.0, 0.0
 
 
 class MicropriceSkew(QuoteAdjuster):
@@ -152,76 +181,70 @@ class ComposedAdjuster(QuoteAdjuster):
         return fair, bid_tox, ask_tox
 
 
+def _build_one(name: str, model_t_path: Optional[str], model_v_path: Optional[str]) -> QuoteAdjuster:
+    if name == "baseline":
+        return QuoteAdjuster()
+    if name.startswith("extlead"):
+        return ExternalLeadSkew(int(name[7:]) / 100.0)  # LinkedIn external-led fair
+    if name.startswith("micro"):
+        return MicropriceSkew(int(name[5:]) / 100.0)
+    if name.startswith("toxgate"):
+        # toxgate = gate only, default 2c scale; toxgateN = N-cent scale.
+        if not model_t_path or not Path(model_t_path).exists():
+            raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
+        suffix = name[7:]
+        gate = ToxicityGate(load_models(model_t_path), scale_dollars=int(suffix) / 100.0 if suffix else 0.02)
+        gate.name = name
+        return gate
+    if name.startswith("combo"):
+        # comboNN = micro NN% + gate (2c); comboNNxM = M-cent gate scale.
+        if not model_t_path or not Path(model_t_path).exists():
+            raise SystemExit("combo variant requires --model-t pointing at a model_t json")
+        body = name[5:]
+        weight_part, scale = (body.split("x", 1)[0], int(body.split("x", 1)[1]) / 100.0) if "x" in body else (body, 0.02)
+        return ComposedAdjuster(
+            [MicropriceSkew(int(weight_part) / 100.0), ToxicityGate(load_models(model_t_path), scale_dollars=scale)],
+            name,
+        )
+    if name.startswith("wide"):
+        widened = QuoteAdjuster()
+        widened.name = name
+        widened.strategy_overrides = {"min_edge_dollars": int(name[4:]) / 100.0}
+        return widened
+    if name.startswith("close"):
+        close_probe = QuoteAdjuster()
+        close_probe.name = name
+        close_probe.strategy_overrides = {"stop_quote_before_close_s": float(int(name[5:]))}
+        return close_probe
+    if name.startswith("modelv"):
+        if not model_v_path or not Path(model_v_path).exists():
+            raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
+        models = [m for m in load_models(model_v_path) if m.meta.get("feature_set") == "book"]
+        variant = ModelVSkew(models, weight=int(name[6:]) / 100.0 if len(name) > 6 else 1.0)
+        variant.name = name
+        return variant
+    raise SystemExit(f"unknown variant: {name}")
+
+
 def build_variants(
     spec: str, model_t_path: Optional[str], model_v_path: Optional[str] = None
 ) -> list[QuoteAdjuster]:
+    """Parse a comma-separated variant spec. 'a+b' composes: fair adjustments
+    chain and per-side taxes accumulate (e.g. extlead50+toxgate6)."""
     variants: list[QuoteAdjuster] = []
     for name in spec.split(","):
         name = name.strip()
-        if name == "baseline":
-            variants.append(QuoteAdjuster())
-        elif name.startswith("micro"):
-            variants.append(MicropriceSkew(int(name[5:]) / 100.0))
-        elif name.startswith("toxgate"):
-            # toxgate = gate only, default 2c scale; toxgateN = N-cent scale.
-            # Isolates the toxicity gate from any microprice skew.
-            if not model_t_path or not Path(model_t_path).exists():
-                raise SystemExit("toxgate variant requires --model-t pointing at a model_t json")
-            suffix = name[7:]
-            scale = int(suffix) / 100.0 if suffix else 0.02
-            gate = ToxicityGate(load_models(model_t_path), scale_dollars=scale)
-            gate.name = name
-            variants.append(gate)
-        elif name.startswith("combo"):
-            # comboNN = micro skew NN% + toxicity gate (default 2c scale);
-            # comboNNxM = same with an M-cent gate scale (e.g. combo25x1).
-            if not model_t_path or not Path(model_t_path).exists():
-                raise SystemExit("combo variant requires --model-t pointing at a model_t json")
-            spec_body = name[5:]
-            if "x" in spec_body:
-                weight_part, scale_part = spec_body.split("x", 1)
-                scale = int(scale_part) / 100.0
-            else:
-                weight_part, scale = spec_body, 0.02
-            variants.append(
-                ComposedAdjuster(
-                    [
-                        MicropriceSkew(int(weight_part) / 100.0),
-                        ToxicityGate(load_models(model_t_path), scale_dollars=scale),
-                    ],
-                    name,
-                )
-            )
-        elif name.startswith("wide"):
-            # wideN = plain baseline quoting with an N-cent minimum edge:
-            # probes the capture-vs-selection curve.
-            widened = QuoteAdjuster()
-            widened.name = name
-            widened.strategy_overrides = {"min_edge_dollars": int(name[4:]) / 100.0}
-            variants.append(widened)
-        elif name.startswith("close"):
-            # closeN = baseline quoting continued into the final minutes down
-            # to an N-second cutoff, where the settlement-averaging model is
-            # most differentiated. Exploratory: separate hypothesis, distinct
-            # risk profile; never a graduation candidate from screening alone.
-            close_probe = QuoteAdjuster()
-            close_probe.name = name
-            close_probe.strategy_overrides = {"stop_quote_before_close_s": float(int(name[5:]))}
-            variants.append(close_probe)
-        elif name.startswith("modelv"):
-            # modelv = full weight (known-failed config, kept for reference);
-            # modelvNN = prediction shrunk to NN% before centering.
-            if not model_v_path or not Path(model_v_path).exists():
-                raise SystemExit("modelv variant requires --model-v pointing at model_v.json")
-            # Use the book-feature-set bucket models (ext-set models require
-            # externals to be fresh; book models degrade more gracefully).
-            models = [m for m in load_models(model_v_path) if m.meta.get("feature_set") == "book"]
-            weight = int(name[6:]) / 100.0 if len(name) > 6 else 1.0
-            variant = ModelVSkew(models, weight=weight)
-            variant.name = name
-            variants.append(variant)
+        if "+" in name:
+            parts = [_build_one(p, model_t_path, model_v_path) for p in name.split("+")]
+            composed = ComposedAdjuster(parts, name)
+            merged: dict = {}
+            for part in parts:
+                merged.update(getattr(part, "strategy_overrides", {}) or {})
+            if merged:
+                composed.strategy_overrides = merged
+            variants.append(composed)
         else:
-            raise SystemExit(f"unknown variant: {name}")
+            variants.append(_build_one(name, model_t_path, model_v_path))
     return variants
 
 
