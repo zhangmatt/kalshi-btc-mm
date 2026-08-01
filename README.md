@@ -2,6 +2,8 @@
 
 Standalone research and maker-execution system for Kalshi `KXBTC15M` contracts.
 
+> **📄 [Project retrospective & case study →](docs/PROJECT_RETROSPECTIVE.md)** — the full story: what was built, the pre-registered validation methodology, and the honest findings (a statistically significant relative edge, but not deployable in the current regime — caught before risking any capital).
+
 The system records Kalshi's sequenced YES order book, BRTI settlement feed, BTC prices, and bounded
 external L2 books from Binance, Coinbase, and Kraken. It prices the actual settlement rule, replays
 maker quotes with queue-ahead constraints, and keeps live order placement behind an explicit
